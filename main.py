@@ -140,6 +140,12 @@ def parse_args() -> argparse.Namespace:
         help="Input video path for --mode stream_event.",
     )
     parser.add_argument(
+        "--device",
+        type=str,
+        default=config.STREAM_DEVICE,
+        help="Execution device for stream_event models: auto, cpu, cuda, or cuda:0.",
+    )
+    parser.add_argument(
         "--covered-class-name",
         action="append",
         type=str,
@@ -577,6 +583,7 @@ def main() -> int:
             new_track_ignore_lower_ratio=args.new_track_ignore_lower_ratio,
             detect_roi_left_ratio=args.detect_roi_left_ratio,
             detect_roi_right_ratio=args.detect_roi_right_ratio,
+            device=args.device,
         )
     else:
         if args.phase == "phase1":

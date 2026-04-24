@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import torch
 from ultralytics import YOLO
 
 from src import config
@@ -26,6 +27,7 @@ class ModelBundle:
     cls2: YOLO
     cls3: YOLO
     seg: YOLO
+    device: str
 
     detect_names: dict[int, str]
     cls1_names: dict[int, str]
@@ -84,6 +86,15 @@ def _ensure_model_path(path_like: Path | str | None, default_path: Path | None, 
     if not path.exists():
         raise FileNotFoundError(f"{name} not found: {path}")
     return path
+
+
+def _resolve_stream_device(device: str | None) -> str:
+    requested = str(device or "auto").strip().lower()
+    if requested in {"", "auto"}:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        return "cpu"
+    return requested
 
 
 def _resolve_ids_by_names(names: dict[int, str], target_names: list[str]) -> list[int]:
@@ -646,7 +657,7 @@ def _should_emit_merged_event(event: dict[str, Any]) -> tuple[bool, str]:
 def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg_conf_threshold: float) -> dict[str, Any]:
     crop = candidate.crop_bgr
 
-    cls1_result = models.cls1.predict(source=crop, device="cpu", verbose=False)[0]
+    cls1_result = models.cls1.predict(source=crop, device=models.device, verbose=False)[0]
     cls1_idx = int(cls1_result.probs.top1)
     cls1_conf = float(cls1_result.probs.top1conf.item())
     cls1_label = models.cls1_names.get(cls1_idx, f"class_{cls1_idx}")
@@ -668,7 +679,7 @@ def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg
     violation = False
 
     if is_fully_covered:
-        cls2_result = models.cls2.predict(source=crop, device="cpu", verbose=False)[0]
+        cls2_result = models.cls2.predict(source=crop, device=models.device, verbose=False)[0]
         cls2_idx = int(cls2_result.probs.top1)
         cls2_conf = float(cls2_result.probs.top1conf.item())
         cls2_label = models.cls2_names.get(cls2_idx, f"class_{cls2_idx}")
@@ -684,7 +695,7 @@ def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg
         }
 
         if is_irregular:
-            cls3_result = models.cls3.predict(source=crop, device="cpu", verbose=False)[0]
+            cls3_result = models.cls3.predict(source=crop, device=models.device, verbose=False)[0]
             cls3_idx = int(cls3_result.probs.top1)
             cls3_conf = float(cls3_result.probs.top1conf.item())
             cls3_label = models.cls3_names.get(cls3_idx, f"class_{cls3_idx}")
@@ -709,7 +720,7 @@ def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg
         else:
             violation = False
     else:
-        seg_result = models.seg.predict(source=crop, device="cpu", conf=seg_conf_threshold, verbose=False)[0]
+        seg_result = models.seg.predict(source=crop, device=models.device, conf=seg_conf_threshold, verbose=False)[0]
         segmentation = _parse_segmentation(seg_result, models.seg_names)
         violation = True
 
@@ -730,11 +741,12 @@ def _load_models(
     cls2_model_path: Path,
     cls3_model_path: Path,
     seg_model_path: Path,
+    device: str,
     logger,
     bed_class_ids: list[int] | None,
     truck_class_ids: list[int] | None,
 ) -> ModelBundle:
-    logger.info("Loading stream models on CPU")
+    logger.info("Loading stream models on %s", device)
     detect = YOLO(str(detect_model_path))
     cls1 = YOLO(str(cls1_model_path))
     cls2 = YOLO(str(cls2_model_path))
@@ -779,6 +791,7 @@ def _load_models(
         cls2=cls2,
         cls3=cls3,
         seg=seg,
+        device=device,
         detect_names=detect_names,
         cls1_names=cls1_names,
         cls2_names=cls2_names,
@@ -1197,6 +1210,7 @@ def run_stream_event(
     event_dedup_window_frames: int = config.STREAM_EVENT_DEDUP_WINDOW_FRAMES,
     event_dedup_iou_threshold: float = config.STREAM_EVENT_DEDUP_IOU_THRESHOLD,
     event_dedup_center_dist_ratio: float = config.STREAM_EVENT_DEDUP_CENTER_DIST_RATIO,
+    device: str = config.STREAM_DEVICE,
     detect_roi_left_ratio: float = config.STREAM_DETECT_ROI_LEFT_RATIO,
     detect_roi_right_ratio: float = config.STREAM_DETECT_ROI_RIGHT_RATIO,
     debug_tracking: bool = False,
@@ -1274,6 +1288,7 @@ def run_stream_event(
     event_dedup_window_frames = max(1, int(event_dedup_window_frames))
     event_dedup_iou_threshold = float(max(0.0, min(1.0, event_dedup_iou_threshold)))
     event_dedup_center_dist_ratio = float(max(0.0, event_dedup_center_dist_ratio))
+    device = _resolve_stream_device(device)
     detect_roi_left_ratio = float(max(0.0, min(0.45, detect_roi_left_ratio)))
     detect_roi_right_ratio = float(max(0.0, min(0.45, detect_roi_right_ratio)))
 
@@ -1299,6 +1314,7 @@ def run_stream_event(
         cls2_model_path=cls2_path,
         cls3_model_path=cls3_path,
         seg_model_path=seg_path,
+        device=device,
         logger=logger,
         bed_class_ids=bed_class_ids if bed_class_ids is not None else config.BED_CLASS_IDS,
         truck_class_ids=truck_class_ids if truck_class_ids is not None else config.TRUCK_CLASS_IDS,
@@ -1587,7 +1603,7 @@ def run_stream_event(
             detect_frame = frame[:, roi_x1:roi_x2]
 
             detection_frames += 1
-            detect_result = models.detect.predict(source=detect_frame, device="cpu", conf=detect_conf, verbose=False)[0]
+            detect_result = models.detect.predict(source=detect_frame, device=models.device, conf=detect_conf, verbose=False)[0]
             detections = _extract_anchor_detections(
                 result=detect_result,
                 names=models.detect_names,
