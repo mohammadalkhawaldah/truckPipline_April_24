@@ -1439,6 +1439,14 @@ def run_stream_event(
                 event.get("event_id"),
             )
             return {}
+        if final_flush and size_event is not None:
+            fill_selection_method = str(getattr(size_event, "fill_selection_method", "") or "")
+            if fill_selection_method == "no_bottom_trigger":
+                logger.info(
+                    "Dropping delayed event_id=%s at final flush (matched only no_bottom_trigger size result)",
+                    event.get("event_id"),
+                )
+                return {}
         merged_event = _merge_size_result_into_event(event, size_event)
         should_emit, drop_reason = _should_emit_merged_event(merged_event)
         if not should_emit:
@@ -1556,6 +1564,8 @@ def run_stream_event(
                     continue
                 if not track.is_confirmed:
                     continue
+                if track.direction_label == "outgoing":
+                    continue
                 if track.bed_box_xyxy is None:
                     continue
 
@@ -1625,6 +1635,8 @@ def run_stream_event(
                 for track in list(active_tracks.values()):
                     if not track.is_confirmed:
                         continue
+                    if track.direction_label == "outgoing":
+                        continue
                     if track.bed_hits < min_bed_persist_frames:
                         continue
                     if not _should_early_infer(track, min_best_area=min_best_area, stable_frames=stable_frames):
@@ -1658,6 +1670,15 @@ def run_stream_event(
                         "Dropping unconfirmed track %s (state=%s, hits=%s/%s)",
                         track.track_id,
                         track.track_state,
+                        track.total_hits,
+                        track.bed_hits,
+                    )
+                    continue
+                if track.direction_label == "outgoing":
+                    logger.info(
+                        "Dropping outgoing-direction track %s (direction=%s, hits=%s/%s)",
+                        track.track_id,
+                        track.direction_label,
                         track.total_hits,
                         track.bed_hits,
                     )
@@ -1770,6 +1791,16 @@ def run_stream_event(
                         "Dropping unconfirmed track %s at EOF (state=%s, hits=%s/%s)",
                         track.track_id,
                         track.track_state,
+                        track.total_hits,
+                        track.bed_hits,
+                    )
+                    tracker.active_tracks.pop(track_id, None)
+                    continue
+                if track.direction_label == "outgoing":
+                    logger.info(
+                        "Dropping outgoing-direction track %s at EOF (direction=%s, hits=%s/%s)",
+                        track.track_id,
+                        track.direction_label,
                         track.total_hits,
                         track.bed_hits,
                     )

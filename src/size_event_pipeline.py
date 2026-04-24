@@ -20,6 +20,9 @@ MAX_MISSED_SAMPLES = 2
 MIN_TRACK_HITS = 2
 MIN_RELIABLE_FILL = 5.0
 MAX_SELECTION_CANDIDATES = 7
+DIRECTION_MIN_HITS = 3
+DIRECTION_MIN_DELTA_RATIO = 0.04
+DIRECTION_MIN_DELTA_PX = 12.0
 
 
 @dataclass
@@ -51,6 +54,12 @@ class SizeTrack:
     trigger_hits_seen: int = 0
     last_trigger_fill_frame: int | None = None
     threshold_reached: bool = False
+    direction_label: str = "unknown"  # unknown | incoming | outgoing
+    direction_locked: bool = False
+    direction_first_center_y: float | None = None
+    direction_last_center_y: float | None = None
+    direction_first_frame: int | None = None
+    direction_last_frame: int | None = None
 
 
 @dataclass
@@ -97,6 +106,25 @@ def compute_iou(box_a, box_b):
 def bbox_center(box):
     x1, y1, x2, y2 = box
     return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def update_track_direction(track: SizeTrack, bbox, frame_index: int, frame_height: int) -> None:
+    _center_x, center_y = bbox_center(bbox)
+    if track.direction_first_center_y is None:
+        track.direction_first_center_y = float(center_y)
+        track.direction_first_frame = int(frame_index)
+    track.direction_last_center_y = float(center_y)
+    track.direction_last_frame = int(frame_index)
+    if track.direction_locked:
+        return
+    if track.hits < DIRECTION_MIN_HITS:
+        return
+    min_delta = max(DIRECTION_MIN_DELTA_PX, float(max(1, frame_height)) * DIRECTION_MIN_DELTA_RATIO)
+    delta_y = float(track.direction_last_center_y - track.direction_first_center_y)
+    if abs(delta_y) < min_delta:
+        return
+    track.direction_label = "incoming" if delta_y > 0 else "outgoing"
+    track.direction_locked = True
 
 
 def bbox_center_distance(box_a, box_b) -> float:
@@ -677,6 +705,9 @@ class OnlineSizeEventPipeline:
             track.bbox = bbox
             track.hits += 1
             track.missed = 0
+            update_track_direction(track, bbox, frame_index, self.current_frame_height)
+            if track.direction_label == "outgoing":
+                continue
             bottom_ratio = float(bbox[3]) / float(max(1, self.current_frame_height))
             if bottom_ratio >= self.trigger_bottom_ratio:
                 track.threshold_reached = True
@@ -704,20 +735,24 @@ class OnlineSizeEventPipeline:
             detection = None
             history: list[SizeDetection] = []
             best_detection: SizeDetection | None = None
-            if threshold_reached:
-                image_path = save_frame(self.output_dir, self.next_track_id, frame_index, frame, bbox)
-                detection = SizeDetection(bbox, confidence, score, frame_index, timestamp_sec, image_path)
-                history = [detection]
-                best_detection = detection
-            self.active_tracks[self.next_track_id] = SizeTrack(
+            new_track = SizeTrack(
                 track_id=self.next_track_id,
                 bbox=bbox,
                 hits=1,
                 missed=0,
-                best_detection=best_detection,
-                history=history,
+                best_detection=None,
+                history=[],
                 threshold_reached=threshold_reached,
             )
+            update_track_direction(new_track, bbox, frame_index, self.current_frame_height)
+            if new_track.direction_label != "outgoing" and threshold_reached:
+                image_path = save_frame(self.output_dir, self.next_track_id, frame_index, frame, bbox)
+                detection = SizeDetection(bbox, confidence, score, frame_index, timestamp_sec, image_path)
+                history = [detection]
+                best_detection = detection
+            new_track.history = history
+            new_track.best_detection = best_detection
+            self.active_tracks[self.next_track_id] = new_track
             if detection is not None:
                 self._maybe_collect_trigger_fill(self.active_tracks[self.next_track_id], detection, frame.shape)
                 self._maybe_precompute_fill(self.active_tracks[self.next_track_id], detection)
@@ -826,6 +861,8 @@ class OnlineSizeEventPipeline:
         return best_track_id
 
     def _complete_track(self, track: SizeTrack) -> None:
+        if track.direction_label == "outgoing":
+            return
         if track.hits < MIN_TRACK_HITS or track.best_detection is None:
             return
         frame_h = max(1, int(self.current_frame_height))

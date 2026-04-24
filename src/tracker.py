@@ -61,6 +61,12 @@ class TrackState:
     phase_results: dict[str, Any] | None = None
     best_image_path: str | None = None
     size_trigger_ready_seen: bool = False
+    direction_label: str = "unknown"  # unknown | incoming | outgoing
+    direction_locked: bool = False
+    direction_first_center_y: float | None = None
+    direction_last_center_y: float | None = None
+    direction_first_frame: int | None = None
+    direction_last_frame: int | None = None
 
     # Backward-compatible aliases for older stream code.
     @property
@@ -95,6 +101,12 @@ class LostTrackSnapshot:
     last_fill_sample_frame: int | None
     phase_results: dict[str, Any] | None
     best_image_path: str | None
+    direction_label: str = "unknown"
+    direction_locked: bool = False
+    direction_first_center_y: float | None = None
+    direction_last_center_y: float | None = None
+    direction_first_frame: int | None = None
+    direction_last_frame: int | None = None
 
 
 def iou_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
@@ -283,6 +295,9 @@ class IoUTracker:
         self.next_track_id = 1
         self.total_tracks_created = 0
         self.total_merges = 0
+        self.direction_min_hits = 3
+        self.direction_min_delta_ratio = 0.04
+        self.direction_min_delta_px = 12.0
 
     def _update_track_state(self, track: TrackState, frame_idx: int) -> None:
         if track.track_state == "confirmed":
@@ -292,7 +307,39 @@ class IoUTracker:
             if track.confirmed_frame is None:
                 track.confirmed_frame = int(frame_idx)
 
-    def _create_track(self, det: Detection, frame_idx: int, track_id: int | None = None) -> TrackState:
+    def _update_track_direction(
+        self,
+        track: TrackState,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> None:
+        if track.raw_truck_box_xyxy is None:
+            return
+        _cx, center_y = center_xyxy(track.raw_truck_box_xyxy)
+        if track.direction_first_center_y is None:
+            track.direction_first_center_y = float(center_y)
+            track.direction_first_frame = int(frame_idx)
+        track.direction_last_center_y = float(center_y)
+        track.direction_last_frame = int(frame_idx)
+        if track.direction_locked:
+            return
+        if track.total_hits < self.direction_min_hits:
+            return
+        frame_h = max(1, int(frame_shape[0])) if frame_shape else 1
+        min_delta = max(self.direction_min_delta_px, float(frame_h) * self.direction_min_delta_ratio)
+        delta_y = float(track.direction_last_center_y - track.direction_first_center_y)
+        if abs(delta_y) < min_delta:
+            return
+        track.direction_label = "incoming" if delta_y > 0 else "outgoing"
+        track.direction_locked = True
+
+    def _create_track(
+        self,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+        track_id: int | None = None,
+    ) -> TrackState:
         if track_id is None:
             track_id = self.next_track_id
             self.next_track_id += 1
@@ -320,6 +367,7 @@ class IoUTracker:
             smooth_truck_box_xyxy_f=(float(tx1), float(ty1), float(tx2), float(ty2)),
             bed_hits=1 if det.bed_box_xyxy is not None else 0,
         )
+        self._update_track_direction(track, frame_idx=frame_idx, frame_shape=frame_shape)
         self._update_track_state(track, frame_idx=frame_idx)
         self.active_tracks[track_id] = track
         return track
@@ -353,6 +401,12 @@ class IoUTracker:
                 last_fill_sample_frame=track.last_fill_sample_frame,
                 phase_results=track.phase_results,
                 best_image_path=track.best_image_path,
+                direction_label=track.direction_label,
+                direction_locked=track.direction_locked,
+                direction_first_center_y=track.direction_first_center_y,
+                direction_last_center_y=track.direction_last_center_y,
+                direction_first_frame=track.direction_first_frame,
+                direction_last_frame=track.direction_last_frame,
             )
         )
 
@@ -447,7 +501,13 @@ class IoUTracker:
                     best_dist = dist
         return best_item, best_iou, best_dist
 
-    def _apply_detection_to_track(self, track: TrackState, det: Detection, frame_idx: int) -> None:
+    def _apply_detection_to_track(
+        self,
+        track: TrackState,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> None:
         track.last_seen_frame = frame_idx
         track.raw_truck_box_xyxy = det.xyxy
         if track.smooth_truck_box_xyxy_f is None:
@@ -477,6 +537,7 @@ class IoUTracker:
         track.last_area = max(0, (tx2 - tx1) * (ty2 - ty1))
         track.max_area_seen = max(track.max_area_seen, track.last_area)
         track.missed_count = 0
+        self._update_track_direction(track, frame_idx=frame_idx, frame_shape=frame_shape)
         self._update_track_state(track, frame_idx=frame_idx)
         self._remove_lost_snapshot(track.track_id)
 
@@ -606,7 +667,12 @@ class IoUTracker:
                 continue
 
             track = self.active_tracks[best_track_id]
-            self._apply_detection_to_track(track=track, det=det, frame_idx=frame_idx)
+            self._apply_detection_to_track(
+                track=track,
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+            )
             assigned_tracks.add(best_track_id)
             matches.append((best_track_id, det, False))
             if self.debug_tracking:
@@ -910,7 +976,12 @@ class IoUTracker:
                 assigned_tracks={track_id for track_id, *_rest in matches},
             )
             if recovered_track is not None:
-                self._apply_detection_to_track(track=recovered_track, det=det, frame_idx=frame_idx)
+                self._apply_detection_to_track(
+                    track=recovered_track,
+                    det=det,
+                    frame_idx=frame_idx,
+                    frame_shape=frame_shape,
+                )
                 matches.append((recovered_track.track_id, det, True))
                 merge_logs.append(
                     f"STALE_ACTIVE_RECOVER: reattached detection to ID={recovered_track.track_id} "
@@ -986,7 +1057,12 @@ class IoUTracker:
                 frame_shape=frame_shape,
             )
             if lost_item is not None and lost_item.track_id not in self.active_tracks:
-                track = self._create_track(det=det, frame_idx=frame_idx, track_id=lost_item.track_id)
+                track = self._create_track(
+                    det=det,
+                    frame_idx=frame_idx,
+                    frame_shape=frame_shape,
+                    track_id=lost_item.track_id,
+                )
                 track.start_frame = int(lost_item.start_frame)
                 track.total_hits = max(1, int(lost_item.total_hits) + 1)
                 track.bed_hits = max(0, int(lost_item.bed_hits) + (1 if det.bed_box_xyxy is not None else 0))
@@ -1001,7 +1077,14 @@ class IoUTracker:
                 track.last_fill_sample_frame = lost_item.last_fill_sample_frame
                 track.phase_results = lost_item.phase_results
                 track.best_image_path = lost_item.best_image_path
+                track.direction_label = lost_item.direction_label
+                track.direction_locked = lost_item.direction_locked
+                track.direction_first_center_y = lost_item.direction_first_center_y
+                track.direction_last_center_y = lost_item.direction_last_center_y
+                track.direction_first_frame = lost_item.direction_first_frame
+                track.direction_last_frame = lost_item.direction_last_frame
                 track.matched_in_update = True
+                self._update_track_direction(track, frame_idx=frame_idx, frame_shape=frame_shape)
                 self._update_track_state(track, frame_idx=frame_idx)
                 self._remove_lost_snapshot(lost_item.track_id)
                 self.total_merges += 1
@@ -1013,7 +1096,12 @@ class IoUTracker:
                 matches.append((track.track_id, det, True))
                 continue
 
-            new_track = self._create_track(det=det, frame_idx=frame_idx, track_id=None)
+            new_track = self._create_track(
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+                track_id=None,
+            )
             new_track.matched_in_update = True
             matches.append((new_track.track_id, det, True))
             if self.debug_tracking:
