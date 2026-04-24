@@ -875,6 +875,7 @@ def _find_dedup_target_event(
     frame_h, frame_w = frame_shape if frame_shape is not None else (0, 0)
     frame_diag = max(1.0, float(math.sqrt((frame_w ** 2) + (frame_h ** 2))))
     max_center_dist = float(max(0.0, center_dist_ratio)) * frame_diag
+    strict_center_dist = max_center_dist * 0.35
     candidate_area = _event_box_area(candidate_box)
 
     for prev in reversed(recent_events):
@@ -897,7 +898,18 @@ def _find_dedup_target_event(
         area_ratio = (
             float(min(candidate_area, prev_area)) / float(max(1, max(candidate_area, prev_area)))
         )
-        if iou >= iou_threshold or (dist <= max_center_dist and area_ratio >= 0.60):
+        overlap_frames = min(c_end, p_end) - max(c_start, p_start) + 1
+        has_temporal_overlap = overlap_frames > 0
+
+        if has_temporal_overlap:
+            if iou >= iou_threshold or (dist <= max_center_dist and area_ratio >= 0.60):
+                return prev, float(iou), float(dist)
+            continue
+
+        # Consecutive trucks in the same lane can look spatially similar after the
+        # previous truck exits. Without real frame overlap, require much stronger
+        # duplicate evidence than the normal in-stream rule.
+        if iou >= max(iou_threshold, 0.90) and dist <= strict_center_dist and area_ratio >= 0.85:
             return prev, float(iou), float(dist)
     return None
 
