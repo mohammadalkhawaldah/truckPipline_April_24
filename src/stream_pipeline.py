@@ -245,6 +245,28 @@ def _extract_anchor_detections(
     return truck_dets
 
 
+def _offset_detection(det: Detection, dx: int, dy: int, frame_w: int, frame_h: int) -> Detection:
+    def _shift_box(box_xyxy: tuple[int, int, int, int] | None) -> tuple[int, int, int, int] | None:
+        if box_xyxy is None:
+            return None
+        x1, y1, x2, y2 = box_xyxy
+        return clamp_xyxy(x1 + dx, y1 + dy, x2 + dx, y2 + dy, frame_w, frame_h)
+
+    shifted_truck = _shift_box(det.xyxy)
+    shifted_bed = _shift_box(det.bed_box_xyxy)
+    if shifted_truck is None:
+        raise ValueError("Detection truck box must not be None")
+    return Detection(
+        xyxy=shifted_truck,
+        conf=det.conf,
+        cls_id=det.cls_id,
+        cls_name=det.cls_name,
+        source=det.source,
+        bed_box_xyxy=shifted_bed,
+        bed_conf=det.bed_conf,
+    )
+
+
 def _compute_centeredness(box_xyxy: tuple[int, int, int, int], frame_w: int, frame_h: int) -> float:
     x1, y1, x2, y2 = box_xyxy
     cx = (x1 + x2) / 2.0
@@ -958,6 +980,7 @@ def _finalize_track_event(
     top2: bool,
     seg_conf_threshold: float,
     events_images_dir: Path,
+    save_event_artifacts: bool,
     final_reason: str,
     vote_enable: bool,
     vote_every_n_frames: int,
@@ -1059,15 +1082,18 @@ def _finalize_track_event(
         vote_counts = {}
     selected_candidate: CropCandidate = best_run["candidate"]
 
-    raw_crop_path = events_images_dir / f"event_{track.track_id:05d}_bed_crop.jpg"
-    cv2.imwrite(str(raw_crop_path), selected_candidate.crop_bgr)
+    raw_crop_path = None
     raw_truck_crop_path = None
-    if selected_candidate.truck_crop_bgr is not None and getattr(selected_candidate.truck_crop_bgr, "size", 0) > 0:
-        raw_truck_crop_path = events_images_dir / f"event_{track.track_id:05d}_truck_crop.jpg"
-        cv2.imwrite(str(raw_truck_crop_path), selected_candidate.truck_crop_bgr)
-    overlay_text = f"event={track.track_id} {result_summary} violation={best_run.get('violation', False)}"
-    overlay_path = events_images_dir / f"event_{track.track_id:05d}_overlay.jpg"
-    _candidate_to_overlay_image(selected_candidate, overlay_text, overlay_path)
+    overlay_path = None
+    if save_event_artifacts:
+        raw_crop_path = events_images_dir / f"event_{track.track_id:05d}_bed_crop.jpg"
+        cv2.imwrite(str(raw_crop_path), selected_candidate.crop_bgr)
+        if selected_candidate.truck_crop_bgr is not None and getattr(selected_candidate.truck_crop_bgr, "size", 0) > 0:
+            raw_truck_crop_path = events_images_dir / f"event_{track.track_id:05d}_truck_crop.jpg"
+            cv2.imwrite(str(raw_truck_crop_path), selected_candidate.truck_crop_bgr)
+        overlay_text = f"event={track.track_id} {result_summary} violation={best_run.get('violation', False)}"
+        overlay_path = events_images_dir / f"event_{track.track_id:05d}_overlay.jpg"
+        _candidate_to_overlay_image(selected_candidate, overlay_text, overlay_path)
 
     event = {
         "event_id": track.track_id,
@@ -1087,9 +1113,9 @@ def _finalize_track_event(
         "final_reason": final_reason,
         "artifacts": {
             "best_image": track.best_image_path,
-            "bed_crop": str(raw_crop_path),
+            "bed_crop": str(raw_crop_path) if raw_crop_path is not None else None,
             "truck_crop": str(raw_truck_crop_path) if raw_truck_crop_path is not None else None,
-            "overlay_image": str(overlay_path),
+            "overlay_image": str(overlay_path) if overlay_path is not None else None,
         },
         "heavy_inference_calls": len(track.inference_runs),
         "vote": {
@@ -1128,6 +1154,8 @@ def run_stream_event(
     size_precompute_max_candidates: int = 3,
     size_precompute_min_gap_frames: int = 10,
     size_keep_candidate_frames: bool = False,
+    save_event_artifacts: bool = config.STREAM_SAVE_EVENT_ARTIFACTS,
+    save_size_artifacts: bool = config.STREAM_SAVE_SIZE_ARTIFACTS,
     size_trigger_fill: bool = True,
     size_trigger_bottom_ratio: float = 0.98,
     size_trigger_max_candidates: int = 3,
@@ -1169,6 +1197,8 @@ def run_stream_event(
     event_dedup_window_frames: int = config.STREAM_EVENT_DEDUP_WINDOW_FRAMES,
     event_dedup_iou_threshold: float = config.STREAM_EVENT_DEDUP_IOU_THRESHOLD,
     event_dedup_center_dist_ratio: float = config.STREAM_EVENT_DEDUP_CENTER_DIST_RATIO,
+    detect_roi_left_ratio: float = config.STREAM_DETECT_ROI_LEFT_RATIO,
+    detect_roi_right_ratio: float = config.STREAM_DETECT_ROI_RIGHT_RATIO,
     debug_tracking: bool = False,
     max_frames: int | None = None,
 ) -> bool:
@@ -1179,13 +1209,17 @@ def run_stream_event(
     size_precompute_max_candidates = max(0, int(size_precompute_max_candidates))
     size_precompute_min_gap_frames = max(0, int(size_precompute_min_gap_frames))
     size_keep_candidate_frames = bool(size_keep_candidate_frames)
+    save_event_artifacts = bool(save_event_artifacts)
+    save_size_artifacts = bool(save_size_artifacts)
     size_trigger_fill = bool(size_trigger_fill)
     size_trigger_bottom_ratio = float(max(0.0, min(1.0, size_trigger_bottom_ratio)))
     size_trigger_max_candidates = max(0, int(size_trigger_max_candidates))
     size_trigger_gap_frames = max(0, int(size_trigger_gap_frames))
     size_trigger_skip_candidates = max(0, int(size_trigger_skip_candidates))
 
-    ensure_dirs([config.OUTPUT_DIR, config.STREAM_EVENTS_IMAGES_DIR, config.PROJECT_ROOT / "logs"])
+    ensure_dirs([config.OUTPUT_DIR, config.PROJECT_ROOT / "logs"])
+    if save_event_artifacts:
+        ensure_dirs([config.STREAM_EVENTS_IMAGES_DIR])
     logger = setup_logger("stream_event", config.PROJECT_ROOT / "logs" / "stream_event.log")
     collected_events: list[dict[str, Any]] = []
     if summary_only:
@@ -1240,6 +1274,8 @@ def run_stream_event(
     event_dedup_window_frames = max(1, int(event_dedup_window_frames))
     event_dedup_iou_threshold = float(max(0.0, min(1.0, event_dedup_iou_threshold)))
     event_dedup_center_dist_ratio = float(max(0.0, event_dedup_center_dist_ratio))
+    detect_roi_left_ratio = float(max(0.0, min(0.45, detect_roi_left_ratio)))
+    detect_roi_right_ratio = float(max(0.0, min(0.45, detect_roi_right_ratio)))
 
     detect_conf = config.DETECT_CONF_THRESHOLD if detect_conf_threshold is None else float(detect_conf_threshold)
     seg_conf = config.PHASE5_SEG_CONF_THRESHOLD if seg_conf_threshold is None else float(seg_conf_threshold)
@@ -1270,7 +1306,9 @@ def run_stream_event(
 
     events_jsonl = config.STREAM_EVENTS_JSONL
     events_images_dir = config.STREAM_EVENTS_IMAGES_DIR
-    ensure_dirs([events_jsonl.parent, events_images_dir])
+    ensure_dirs([events_jsonl.parent])
+    if save_event_artifacts:
+        ensure_dirs([events_images_dir])
 
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
@@ -1309,6 +1347,7 @@ def run_stream_event(
             precompute_max_candidates=size_precompute_max_candidates,
             precompute_min_gap_frames=size_precompute_min_gap_frames,
             keep_candidate_frames=size_keep_candidate_frames,
+            save_artifacts=save_size_artifacts,
             trigger_fill=size_trigger_fill,
             trigger_bottom_ratio=size_trigger_bottom_ratio,
             trigger_max_candidates=size_trigger_max_candidates,
@@ -1363,7 +1402,7 @@ def run_stream_event(
         "infer_mode=%s | top2=%s | vote=%s vote_every=%s vote_max_samples=%s | "
         "confirm_hits=%s | dedup=%s dedup_window=%s dedup_iou=%.2f dedup_center_ratio=%.3f | "
         "smooth_alpha=%.2f deadband=%.1f max_step=%.1f active_center_ratio=%.3f "
-        "dup_iou=%.2f max_detect_fps=%.2f ignore_new_lower=%.2f",
+        "dup_iou=%.2f max_detect_fps=%.2f ignore_new_lower=%.2f detect_roi_left=%.2f detect_roi_right=%.2f",
         video,
         every_n,
         missed_M,
@@ -1390,6 +1429,8 @@ def run_stream_event(
         duplicate_iou_threshold,
         max_detect_fps,
         new_track_ignore_lower_ratio,
+        detect_roi_left_ratio,
+        detect_roi_right_ratio,
     )
 
     frame_idx = -1
@@ -1537,16 +1578,27 @@ def run_stream_event(
                         break
                 continue
 
-            detection_frames += 1
-            detect_result = models.detect.predict(source=frame, device="cpu", conf=detect_conf, verbose=False)[0]
             frame_h, frame_w = frame.shape[:2]
             last_frame_shape = (frame_h, frame_w)
+            roi_x1 = int(round(frame_w * detect_roi_left_ratio))
+            roi_x2 = int(round(frame_w * (1.0 - detect_roi_right_ratio)))
+            roi_x1 = max(0, min(roi_x1, max(0, frame_w - 1)))
+            roi_x2 = max(roi_x1 + 1, min(roi_x2, frame_w))
+            detect_frame = frame[:, roi_x1:roi_x2]
+
+            detection_frames += 1
+            detect_result = models.detect.predict(source=detect_frame, device="cpu", conf=detect_conf, verbose=False)[0]
             detections = _extract_anchor_detections(
                 result=detect_result,
                 names=models.detect_names,
                 truck_ids=models.truck_ids,
                 bed_ids=models.bed_ids,
             )
+            if roi_x1 != 0:
+                detections = [
+                    _offset_detection(det, dx=roi_x1, dy=0, frame_w=frame_w, frame_h=frame_h)
+                    for det in detections
+                ]
             active_before = set(tracker.active_tracks.keys())
             active_tracks, finalized_tracks, merge_logs = tracker.update(
                 detections=detections,
@@ -1627,9 +1679,10 @@ def run_stream_event(
                         2,
                         cv2.LINE_AA,
                     )
-                    best_image_path = events_images_dir / f"event_{track.track_id:05d}_best.jpg"
-                    cv2.imwrite(str(best_image_path), debug_frame)
-                    track.best_image_path = str(best_image_path)
+                    if save_event_artifacts:
+                        best_image_path = events_images_dir / f"event_{track.track_id:05d}_best.jpg"
+                        cv2.imwrite(str(best_image_path), debug_frame)
+                        track.best_image_path = str(best_image_path)
 
             if event_infer_mode == "early":
                 for track in list(active_tracks.values()):
@@ -1717,6 +1770,7 @@ def run_stream_event(
                     top2=bool(top2),
                     seg_conf_threshold=seg_conf,
                     events_images_dir=events_images_dir,
+                    save_event_artifacts=save_event_artifacts,
                     final_reason="missed_M_frames",
                     vote_enable=vote_enable,
                     vote_every_n_frames=vote_every_n_frames,
@@ -1843,6 +1897,7 @@ def run_stream_event(
                     top2=bool(top2),
                     seg_conf_threshold=seg_conf,
                     events_images_dir=events_images_dir,
+                    save_event_artifacts=save_event_artifacts,
                     final_reason="end_of_video",
                     vote_enable=vote_enable,
                     vote_every_n_frames=vote_every_n_frames,

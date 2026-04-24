@@ -33,6 +33,7 @@ class SizeDetection:
     frame_index: int
     timestamp_sec: float
     image_path: Path | None
+    crop_bgr: Any | None = None
     fill_percentage: float | None = None
     fill_status: str = "pending"
     raw_output: str = ""
@@ -428,17 +429,19 @@ def evaluate_track_detections(detections, truck_model, size_model, truck_classes
     for detection in detections:
         if detection.fill_status != "pending":
             continue
-        if detection.image_path is None:
-            detection.fill_percentage = None
-            detection.raw_output = "No saved candidate image"
-            detection.fill_status = "failed"
-            continue
-        frame = cv2.imread(str(detection.image_path))
+        frame = detection.crop_bgr
         if frame is None:
-            detection.fill_percentage = None
-            detection.raw_output = "Error loading image"
-            detection.fill_status = "failed"
-            continue
+            if detection.image_path is None:
+                detection.fill_percentage = None
+                detection.raw_output = "No candidate image available"
+                detection.fill_status = "failed"
+                continue
+            frame = cv2.imread(str(detection.image_path))
+            if frame is None:
+                detection.fill_percentage = None
+                detection.raw_output = "Error loading image"
+                detection.fill_status = "failed"
+                continue
 
         fill_percentage, raw_output = estimate_fill_for_crop(
             frame,
@@ -627,7 +630,7 @@ def run_size_event_pipeline(
                 best_bbox=best.bbox,
                 fill_percentage=best.fill_percentage,
                 fill_status=best.fill_status,
-                best_frame_path=str(best.image_path),
+                best_frame_path=str(best.image_path) if best.image_path is not None else "",
                 raw_output=best.raw_output,
                 history_frames=history_frames,
                 shortlist_frames=shortlist_frames,
@@ -654,6 +657,7 @@ class OnlineSizeEventPipeline:
         precompute_max_candidates: int = 3,
         precompute_min_gap_frames: int = 10,
         keep_candidate_frames: bool = False,
+        save_artifacts: bool = True,
         trigger_fill: bool = True,
         trigger_bottom_ratio: float = 0.98,
         trigger_max_candidates: int = 3,
@@ -676,6 +680,7 @@ class OnlineSizeEventPipeline:
         self.precompute_max_candidates = max(0, int(precompute_max_candidates))
         self.precompute_min_gap_frames = max(0, int(precompute_min_gap_frames))
         self.keep_candidate_frames = bool(keep_candidate_frames)
+        self.save_artifacts = bool(save_artifacts)
         self.trigger_fill = bool(trigger_fill)
         self.trigger_bottom_ratio = float(max(0.0, min(1.0, trigger_bottom_ratio)))
         self.trigger_max_candidates = max(0, int(trigger_max_candidates))
@@ -713,8 +718,9 @@ class OnlineSizeEventPipeline:
                 track.threshold_reached = True
             if not track.threshold_reached:
                 continue
-            image_path = save_frame(self.output_dir, track_id, frame_index, frame, bbox)
-            detection = SizeDetection(bbox, confidence, score, frame_index, timestamp_sec, image_path)
+            crop_bgr = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]].copy()
+            image_path = save_frame(self.output_dir, track_id, frame_index, frame, bbox) if self.save_artifacts else None
+            detection = SizeDetection(bbox, confidence, score, frame_index, timestamp_sec, image_path, crop_bgr=crop_bgr)
             track.history.append(detection)
             if track.best_detection is None or score > track.best_detection.score:
                 track.best_detection = detection
@@ -746,8 +752,9 @@ class OnlineSizeEventPipeline:
             )
             update_track_direction(new_track, bbox, frame_index, self.current_frame_height)
             if new_track.direction_label != "outgoing" and threshold_reached:
-                image_path = save_frame(self.output_dir, self.next_track_id, frame_index, frame, bbox)
-                detection = SizeDetection(bbox, confidence, score, frame_index, timestamp_sec, image_path)
+                crop_bgr = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]].copy()
+                image_path = save_frame(self.output_dir, self.next_track_id, frame_index, frame, bbox) if self.save_artifacts else None
+                detection = SizeDetection(bbox, confidence, score, frame_index, timestamp_sec, image_path, crop_bgr=crop_bgr)
                 history = [detection]
                 best_detection = detection
             new_track.history = history
@@ -984,18 +991,20 @@ class OnlineSizeEventPipeline:
             best_bbox=best.bbox,
             fill_percentage=best.fill_percentage,
             fill_status=best.fill_status,
-            best_frame_path=str(best.image_path),
+            best_frame_path=str(best.image_path) if best.image_path is not None else "",
             raw_output=best.raw_output,
             history_frames=history_frames,
             shortlist_frames=shortlist_frames,
             fill_selection_method=fill_selection_method,
             trigger_frames=trigger_frames,
         )
-        if not self.keep_candidate_frames:
+        if not self.keep_candidate_frames and self.save_artifacts:
             self._cleanup_track_images(track, keep_path=best.image_path)
         return event
 
-    def _cleanup_track_images(self, track: SizeTrack, keep_path: Path) -> None:
+    def _cleanup_track_images(self, track: SizeTrack, keep_path: Path | None) -> None:
+        if keep_path is None:
+            return
         keep_resolved = Path(keep_path).resolve()
         for detection in track.history:
             if detection.image_path is None:

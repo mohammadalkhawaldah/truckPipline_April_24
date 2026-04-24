@@ -374,6 +374,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--save-event-artifacts",
+        type=int,
+        choices=[0, 1],
+        default=1 if config.STREAM_SAVE_EVENT_ARTIFACTS else 0,
+        help="Save first-repo event images like best/bed/truck/overlay for debugging.",
+    )
+    parser.add_argument(
+        "--save-size-artifacts",
+        type=int,
+        choices=[0, 1],
+        default=1 if config.STREAM_SAVE_SIZE_ARTIFACTS else 0,
+        help="Save second-repo size candidate/winner crop images for debugging.",
+    )
+    parser.add_argument(
         "--preview-scale",
         type=float,
         default=1.0,
@@ -466,6 +480,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--detect-roi-left-ratio",
+        type=float,
+        default=config.STREAM_DETECT_ROI_LEFT_RATIO,
+        help="Ignore the left X ratio of the frame for the always-on first-repo detector.",
+    )
+    parser.add_argument(
+        "--detect-roi-right-ratio",
+        type=float,
+        default=config.STREAM_DETECT_ROI_RIGHT_RATIO,
+        help="Ignore the right X ratio of the frame for the always-on first-repo detector.",
+    )
+    parser.add_argument(
         "--non-interactive-model-select",
         action="store_true",
         help="Disable interactive prompt if multiple models are found; highest-scored candidate is used.",
@@ -518,6 +544,8 @@ def main() -> int:
             size_precompute_max_candidates=args.size_precompute_max,
             size_precompute_min_gap_frames=args.size_precompute_gap,
             size_keep_candidate_frames=bool(args.size_keep_candidate_frames),
+            save_event_artifacts=bool(args.save_event_artifacts),
+            save_size_artifacts=bool(args.save_size_artifacts),
             size_trigger_fill=bool(args.size_trigger_fill),
             size_trigger_bottom_ratio=args.size_trigger_bottom_ratio,
             size_trigger_max_candidates=args.size_trigger_max_candidates,
@@ -547,6 +575,8 @@ def main() -> int:
             event_dedup_iou_threshold=args.event_dedup_iou,
             event_dedup_center_dist_ratio=args.event_dedup_center_ratio,
             new_track_ignore_lower_ratio=args.new_track_ignore_lower_ratio,
+            detect_roi_left_ratio=args.detect_roi_left_ratio,
+            detect_roi_right_ratio=args.detect_roi_right_ratio,
         )
     else:
         if args.phase == "phase1":
