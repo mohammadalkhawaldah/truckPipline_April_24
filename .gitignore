@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+pipeline_venv/
+.venv/
+.venv_truk_pipline/
+.venv_truck_size_2/
+
+# Local artifacts
+outputs/
+logs/
+combined_logs/
+data/
+test_images/
+
+# Model weights (keep local)
+weights/**/*.pt
+!weights/weights_March_25/best_1st_cls_March_25.pt
+!weights/weights_March_25/best_Truck_Box_Extraction_March_25.pt
+!weights/weights_March_25/best_yolo11_seg_march_26v2.pt
+!weights/classification#2/best.pt
+!weights/classification#3_new1/best_5classes.pt
+!weights/Yolo-wight/truck.pt
+!weights/Yolo-wight/best_size_March_25.pt
+
+# Local debug/test images created during development
+Dump_Truck_(7097582821).jpg
+MAN_dump_truck_(2).jpg
+Peterbilt_truck_3.jpg
+

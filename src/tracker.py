@@ -1,0 +1,1123 @@
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class Detection:
+    # Anchor box for identity matching (truck box).
+    xyxy: tuple[int, int, int, int]
+    conf: float
+    cls_id: int
+    cls_name: str
+    source: str = "truck_direct"
+    # Optional child bed for crop/inference on same frame.
+    bed_box_xyxy: tuple[int, int, int, int] | None = None
+    bed_conf: float = 0.0
+
+
+@dataclass
+class CropCandidate:
+    frame_idx: int
+    xyxy: tuple[int, int, int, int]
+    area: int
+    conf: float
+    centeredness: float
+    score: float
+    crop_bgr: Any
+    truck_xyxy: tuple[int, int, int, int] | None = None
+    truck_crop_bgr: Any = None
+
+
+@dataclass
+class TrackState:
+    track_id: int
+    start_frame: int
+    last_seen_frame: int
+    truck_box_xyxy: tuple[int, int, int, int]
+    raw_truck_box_xyxy: tuple[int, int, int, int]
+    bed_box_xyxy: tuple[int, int, int, int] | None
+    bed_conf: float
+    last_conf: float
+    missed_count: int = 0
+    matched_in_update: bool = False
+    total_hits: int = 1
+    bed_hits: int = 0
+    stable_count: int = 0
+    max_area_seen: int = 0
+    last_area: int = 0
+    track_state: str = "tentative"  # tentative | confirmed
+    confirmed_frame: int | None = None
+    smooth_truck_box_xyxy_f: tuple[float, float, float, float] | None = None
+    best_candidate: CropCandidate | None = None
+    top_candidates: list[CropCandidate] = field(default_factory=list)
+    vote_candidates: list[CropCandidate] = field(default_factory=list)
+    last_vote_sample_frame: int | None = None
+    fill_candidates: list[CropCandidate] = field(default_factory=list)
+    last_fill_sample_frame: int | None = None
+    inference_runs: list[dict[str, Any]] = field(default_factory=list)
+    phase_results: dict[str, Any] | None = None
+    best_image_path: str | None = None
+    size_trigger_ready_seen: bool = False
+
+    # Backward-compatible aliases for older stream code.
+    @property
+    def last_box_xyxy(self) -> tuple[int, int, int, int]:
+        return self.truck_box_xyxy
+
+    @property
+    def smooth_box_xyxy_f(self) -> tuple[float, float, float, float] | None:
+        return self.smooth_truck_box_xyxy_f
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.track_state == "confirmed"
+
+
+@dataclass
+class LostTrackSnapshot:
+    track_id: int
+    start_frame: int
+    last_truck_box: tuple[int, int, int, int]
+    last_seen_frame: int
+    total_hits: int
+    bed_hits: int
+    track_state: str
+    confirmed_frame: int | None
+    max_area_seen: int
+    last_area: int
+    best_candidate: CropCandidate | None
+    vote_candidates: list[CropCandidate]
+    last_vote_sample_frame: int | None
+    fill_candidates: list[CropCandidate]
+    last_fill_sample_frame: int | None
+    phase_results: dict[str, Any] | None
+    best_image_path: str | None
+
+
+def iou_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return float(inter / union)
+
+
+def overlap_over_min_area_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    denom = min(area_a, area_b)
+    if denom <= 0:
+        return 0.0
+    return float(inter / denom)
+
+
+def center_xyxy(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def center_distance(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax, ay = center_xyxy(a)
+    bx, by = center_xyxy(b)
+    return float(((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5)
+
+
+def clamp_box_xyxy(
+    box: tuple[float, float, float, float],
+    frame_w: int,
+    frame_h: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = box
+    x1 = max(0, min(int(round(x1)), max(0, frame_w - 1)))
+    y1 = max(0, min(int(round(y1)), max(0, frame_h - 1)))
+    x2 = max(0, min(int(round(x2)), frame_w))
+    y2 = max(0, min(int(round(y2)), frame_h))
+    if x2 <= x1:
+        x2 = min(frame_w, x1 + 1)
+    if y2 <= y1:
+        y2 = min(frame_h, y1 + 1)
+    return (x1, y1, x2, y2)
+
+
+def expand_box_xyxy(
+    box: tuple[int, int, int, int],
+    x_scale: float,
+    y_scale: float,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = box
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    w = max(1.0, float(x2 - x1)) * max(0.01, float(x_scale))
+    h = max(1.0, float(y2 - y1)) * max(0.01, float(y_scale))
+    nx1 = cx - (w / 2.0)
+    ny1 = cy - (h / 2.0)
+    nx2 = cx + (w / 2.0)
+    ny2 = cy + (h / 2.0)
+    return clamp_box_xyxy((nx1, ny1, nx2, ny2), frame_w, frame_h)
+
+
+def _smooth_box(
+    prev: tuple[float, float, float, float],
+    new_box: tuple[int, int, int, int],
+    alpha: float,
+    deadband_px: float,
+    max_step_px: float,
+) -> tuple[float, float, float, float]:
+    target = (float(new_box[0]), float(new_box[1]), float(new_box[2]), float(new_box[3]))
+    smoothed = []
+    for p, t in zip(prev, target):
+        val = (1.0 - alpha) * p + alpha * t
+        if max_step_px > 0.0:
+            delta = val - p
+            if delta > max_step_px:
+                val = p + max_step_px
+            elif delta < -max_step_px:
+                val = p - max_step_px
+        if abs(val - p) < deadband_px:
+            val = p
+        smoothed.append(val)
+    return (smoothed[0], smoothed[1], smoothed[2], smoothed[3])
+
+
+def _round_box(box_f: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    return (
+        int(round(box_f[0])),
+        int(round(box_f[1])),
+        int(round(box_f[2])),
+        int(round(box_f[3])),
+    )
+
+
+class IoUTracker:
+    def __init__(
+        self,
+        iou_threshold: float = 0.25,
+        missed_M: int = 15,
+        track_confirm_hits: int = 4,
+        top2: bool = False,
+        smooth_alpha: float = 0.20,
+        smooth_deadband_px: float = 4.0,
+        smooth_max_step_px: float = 12.0,
+        merge_window_frames: int = 10,
+        merge_iou_threshold: float = 0.20,
+        merge_center_dist_ratio: float = 0.15,
+        active_match_center_dist_ratio: float = 0.08,
+        duplicate_iou_threshold: float = 0.85,
+        active_duplicate_iou_threshold: float = 0.45,
+        active_duplicate_bed_iou_threshold: float = 0.25,
+        startup_duplicate_window_frames: int = 12,
+        startup_duplicate_iou_threshold: float = 0.30,
+        startup_duplicate_bed_iou_threshold: float = 0.20,
+        startup_duplicate_center_dist_ratio: float = 0.18,
+        startup_duplicate_overlap_ratio: float = 0.60,
+        exit_duplicate_iou_threshold: float = 0.35,
+        exit_duplicate_bed_iou_threshold: float = 0.25,
+        new_track_ignore_lower_ratio: float = 0.0,
+        edge_guard: bool = True,
+        edge_margin: int = 80,
+        recently_lost_maxlen: int = 256,
+        debug_tracking: bool = False,
+    ) -> None:
+        self.iou_threshold = float(iou_threshold)
+        self.missed_M = int(missed_M)
+        self.track_confirm_hits = int(max(1, track_confirm_hits))
+        self.keep_top_k = 2 if bool(top2) else 1
+        self.smooth_alpha = float(max(0.01, min(1.0, smooth_alpha)))
+        self.smooth_deadband_px = float(max(0.0, smooth_deadband_px))
+        self.smooth_max_step_px = float(max(0.0, smooth_max_step_px))
+        self.merge_window_frames = int(max(1, merge_window_frames))
+        self.merge_iou_threshold = float(max(0.0, min(1.0, merge_iou_threshold)))
+        self.merge_center_dist_ratio = float(max(0.0, merge_center_dist_ratio))
+        self.active_match_center_dist_ratio = float(max(0.0, active_match_center_dist_ratio))
+        self.duplicate_iou_threshold = float(max(0.0, min(1.0, duplicate_iou_threshold)))
+        self.active_duplicate_iou_threshold = float(max(0.0, min(1.0, active_duplicate_iou_threshold)))
+        self.active_duplicate_bed_iou_threshold = float(max(0.0, min(1.0, active_duplicate_bed_iou_threshold)))
+        self.startup_duplicate_window_frames = int(max(0, startup_duplicate_window_frames))
+        self.startup_duplicate_iou_threshold = float(max(0.0, min(1.0, startup_duplicate_iou_threshold)))
+        self.startup_duplicate_bed_iou_threshold = float(max(0.0, min(1.0, startup_duplicate_bed_iou_threshold)))
+        self.startup_duplicate_center_dist_ratio = float(max(0.0, startup_duplicate_center_dist_ratio))
+        self.startup_duplicate_overlap_ratio = float(max(0.0, min(1.0, startup_duplicate_overlap_ratio)))
+        self.exit_duplicate_iou_threshold = float(max(0.0, min(1.0, exit_duplicate_iou_threshold)))
+        self.exit_duplicate_bed_iou_threshold = float(max(0.0, min(1.0, exit_duplicate_bed_iou_threshold)))
+        self.new_track_ignore_lower_ratio = float(max(0.0, min(0.95, new_track_ignore_lower_ratio)))
+        self.edge_guard = bool(edge_guard)
+        self.edge_margin = int(max(0, edge_margin))
+        self.debug_tracking = bool(debug_tracking)
+
+        self.active_tracks: dict[int, TrackState] = {}
+        self.recently_lost: deque[LostTrackSnapshot] = deque(maxlen=max(8, int(recently_lost_maxlen)))
+        self.next_track_id = 1
+        self.total_tracks_created = 0
+        self.total_merges = 0
+
+    def _update_track_state(self, track: TrackState, frame_idx: int) -> None:
+        if track.track_state == "confirmed":
+            return
+        if track.total_hits >= self.track_confirm_hits:
+            track.track_state = "confirmed"
+            if track.confirmed_frame is None:
+                track.confirmed_frame = int(frame_idx)
+
+    def _create_track(self, det: Detection, frame_idx: int, track_id: int | None = None) -> TrackState:
+        if track_id is None:
+            track_id = self.next_track_id
+            self.next_track_id += 1
+            self.total_tracks_created += 1
+        else:
+            self.next_track_id = max(self.next_track_id, track_id + 1)
+
+        tx1, ty1, tx2, ty2 = det.xyxy
+        t_area = max(0, (tx2 - tx1) * (ty2 - ty1))
+        initial_state = "confirmed" if self.track_confirm_hits <= 1 else "tentative"
+        initial_confirmed_frame = frame_idx if initial_state == "confirmed" else None
+        track = TrackState(
+            track_id=track_id,
+            start_frame=frame_idx,
+            last_seen_frame=frame_idx,
+            truck_box_xyxy=det.xyxy,
+            raw_truck_box_xyxy=det.xyxy,
+            bed_box_xyxy=det.bed_box_xyxy,
+            bed_conf=float(det.bed_conf),
+            last_conf=float(det.conf),
+            max_area_seen=t_area,
+            last_area=t_area,
+            track_state=initial_state,
+            confirmed_frame=initial_confirmed_frame,
+            smooth_truck_box_xyxy_f=(float(tx1), float(ty1), float(tx2), float(ty2)),
+            bed_hits=1 if det.bed_box_xyxy is not None else 0,
+        )
+        self._update_track_state(track, frame_idx=frame_idx)
+        self.active_tracks[track_id] = track
+        return track
+
+    def _remove_lost_snapshot(self, track_id: int) -> None:
+        if not self.recently_lost:
+            return
+        self.recently_lost = deque(
+            [x for x in self.recently_lost if x.track_id != track_id],
+            maxlen=self.recently_lost.maxlen,
+        )
+
+    def _upsert_lost_snapshot(self, track: TrackState) -> None:
+        self._remove_lost_snapshot(track.track_id)
+        self.recently_lost.append(
+            LostTrackSnapshot(
+                track_id=track.track_id,
+                start_frame=track.start_frame,
+                last_truck_box=track.raw_truck_box_xyxy,
+                last_seen_frame=track.last_seen_frame,
+                total_hits=track.total_hits,
+                bed_hits=track.bed_hits,
+                track_state=track.track_state,
+                confirmed_frame=track.confirmed_frame,
+                max_area_seen=track.max_area_seen,
+                last_area=track.last_area,
+                best_candidate=track.best_candidate,
+                vote_candidates=list(track.vote_candidates),
+                last_vote_sample_frame=track.last_vote_sample_frame,
+                fill_candidates=list(track.fill_candidates),
+                last_fill_sample_frame=track.last_fill_sample_frame,
+                phase_results=track.phase_results,
+                best_image_path=track.best_image_path,
+            )
+        )
+
+    def _prune_lost(self, frame_idx: int) -> None:
+        if not self.recently_lost:
+            return
+        kept = [
+            x for x in self.recently_lost
+            if (frame_idx - x.last_seen_frame) <= self.merge_window_frames
+        ]
+        self.recently_lost = deque(kept, maxlen=self.recently_lost.maxlen)
+
+    def _near_edge(self, box: tuple[int, int, int, int], frame_w: int, frame_h: int) -> bool:
+        cx, cy = center_xyxy(box)
+        return bool(
+            cx <= self.edge_margin
+            or cy <= self.edge_margin
+            or cx >= (frame_w - self.edge_margin)
+            or cy >= (frame_h - self.edge_margin)
+        )
+
+    def _find_midscene_blocking_track(
+        self,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> TrackState | None:
+        frame_h, frame_w = frame_shape
+        if self._near_edge(det.xyxy, frame_w, frame_h):
+            return None
+
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.active_match_center_dist_ratio * frame_diag
+        best_track = None
+        best_key = (-1.0, -1.0, float("-inf"))
+
+        for track in self.active_tracks.values():
+            if not track.is_confirmed:
+                continue
+            if track.last_seen_frame < (frame_idx - 1):
+                continue
+            if self._near_edge(track.raw_truck_box_xyxy, frame_w, frame_h):
+                continue
+
+            truck_iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            overlap_ratio = overlap_over_min_area_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            cdist = center_distance(det.xyxy, track.raw_truck_box_xyxy)
+            bed_iou = 0.0
+            if det.bed_box_xyxy is not None and track.bed_box_xyxy is not None:
+                bed_iou = iou_xyxy(det.bed_box_xyxy, track.bed_box_xyxy)
+
+            similar_enough = (
+                truck_iou >= self.active_duplicate_iou_threshold
+                or bed_iou >= self.active_duplicate_bed_iou_threshold
+                or overlap_ratio >= 0.65
+                or cdist <= max_center_dist
+            )
+            if not similar_enough:
+                continue
+
+            candidate_key = (truck_iou, overlap_ratio, -cdist)
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_track = track
+
+        return best_track
+
+    def _try_merge_with_recently_lost(
+        self,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> tuple[LostTrackSnapshot | None, float, float]:
+        self._prune_lost(frame_idx)
+        frame_h, frame_w = frame_shape
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.merge_center_dist_ratio * frame_diag
+
+        best_item = None
+        best_iou = -1.0
+        best_dist = float("inf")
+        for item in self.recently_lost:
+            gap = frame_idx - item.last_seen_frame
+            if gap > self.merge_window_frames:
+                continue
+            iou = iou_xyxy(det.xyxy, item.last_truck_box)
+            dist = center_distance(det.xyxy, item.last_truck_box)
+            if iou >= self.merge_iou_threshold or dist <= max_center_dist:
+                if (iou, -dist) > (best_iou, -best_dist):
+                    best_item = item
+                    best_iou = iou
+                    best_dist = dist
+        return best_item, best_iou, best_dist
+
+    def _apply_detection_to_track(self, track: TrackState, det: Detection, frame_idx: int) -> None:
+        track.last_seen_frame = frame_idx
+        track.raw_truck_box_xyxy = det.xyxy
+        if track.smooth_truck_box_xyxy_f is None:
+            track.smooth_truck_box_xyxy_f = (
+                float(det.xyxy[0]),
+                float(det.xyxy[1]),
+                float(det.xyxy[2]),
+                float(det.xyxy[3]),
+            )
+        else:
+            track.smooth_truck_box_xyxy_f = _smooth_box(
+                prev=track.smooth_truck_box_xyxy_f,
+                new_box=det.xyxy,
+                alpha=self.smooth_alpha,
+                deadband_px=self.smooth_deadband_px,
+                max_step_px=self.smooth_max_step_px,
+            )
+        track.truck_box_xyxy = _round_box(track.smooth_truck_box_xyxy_f)
+        track.bed_box_xyxy = det.bed_box_xyxy
+        track.bed_conf = float(det.bed_conf)
+        track.last_conf = float(det.conf)
+        track.matched_in_update = True
+        track.total_hits += 1
+        if det.bed_box_xyxy is not None:
+            track.bed_hits += 1
+        tx1, ty1, tx2, ty2 = track.truck_box_xyxy
+        track.last_area = max(0, (tx2 - tx1) * (ty2 - ty1))
+        track.max_area_seen = max(track.max_area_seen, track.last_area)
+        track.missed_count = 0
+        self._update_track_state(track, frame_idx=frame_idx)
+        self._remove_lost_snapshot(track.track_id)
+
+    def _try_recover_stale_active_track(
+        self,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+        assigned_tracks: set[int],
+    ) -> tuple[TrackState | None, float, float]:
+        frame_h, frame_w = frame_shape
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.merge_center_dist_ratio * frame_diag
+        fallback_center_dist = max(max_center_dist, 0.35 * frame_diag)
+
+        best_track = None
+        best_iou = -1.0
+        best_dist = float("inf")
+        best_key = (False, False, -1.0, float("-inf"), float("-inf"))
+        stale_candidates: list[tuple[TrackState, float, float]] = []
+
+        for track_id, track in self.active_tracks.items():
+            if track_id in assigned_tracks:
+                continue
+            if track.last_seen_frame >= frame_idx:
+                continue
+
+            iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            dist = center_distance(det.xyxy, track.raw_truck_box_xyxy)
+            stale_candidates.append((track, iou, dist))
+            bed_iou = 0.0
+            if det.bed_box_xyxy is not None and track.bed_box_xyxy is not None:
+                bed_iou = iou_xyxy(det.bed_box_xyxy, track.bed_box_xyxy)
+
+            matched_by_iou = iou >= self.merge_iou_threshold
+            matched_by_center = dist <= max_center_dist
+            matched_by_bed = bed_iou >= self.active_duplicate_bed_iou_threshold
+            if not matched_by_iou and not matched_by_center and not matched_by_bed:
+                continue
+
+            candidate_key = (
+                track.is_confirmed,
+                matched_by_iou,
+                bed_iou,
+                -dist,
+                float(track.total_hits),
+            )
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_track = track
+                best_iou = iou
+                best_dist = dist
+
+        if best_track is not None:
+            return best_track, best_iou, best_dist
+
+        current_frame_confirmed_tracks = [
+            track
+            for track in self.active_tracks.values()
+            if track.is_confirmed and track.last_seen_frame == frame_idx
+        ]
+        confirmed_stale = [
+            (track, iou, dist)
+            for track, iou, dist in stale_candidates
+            if track.is_confirmed and (frame_idx - track.last_seen_frame) <= self.merge_window_frames
+        ]
+        if len(current_frame_confirmed_tracks) == 0 and len(confirmed_stale) == 1:
+            track, iou, dist = confirmed_stale[0]
+            if dist <= fallback_center_dist:
+                return track, iou, dist
+
+        return best_track, best_iou, best_dist
+
+    def _match_detections_to_tracks(
+        self,
+        detections: list[Detection],
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> tuple[list[tuple[int, Detection, bool]], list[str]]:
+        frame_h, frame_w = frame_shape
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.active_match_center_dist_ratio * frame_diag
+        for track in self.active_tracks.values():
+            track.matched_in_update = False
+
+        matches: list[tuple[int, Detection, bool]] = []
+        debug_logs: list[str] = []
+        assigned_tracks: set[int] = set()
+
+        for det in sorted(detections, key=lambda d: d.conf, reverse=True):
+            best_track_id = None
+            best_key = (False, -1.0, float("-inf"), float("-inf"))
+            det_logs: list[str] = []
+            for track_id, track in self.active_tracks.items():
+                if track_id in assigned_tracks:
+                    continue
+                iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+                dist = center_distance(det.xyxy, track.raw_truck_box_xyxy)
+                matched_by_iou = iou >= self.iou_threshold
+                matched_by_center = dist <= max_center_dist
+                if self.debug_tracking:
+                    det_logs.append(
+                        f"TRACK_DEBUG frame={frame_idx} det={det.xyxy} cand_id={track_id} "
+                        f"track_box={track.raw_truck_box_xyxy} iou={iou:.3f} dist={dist:.1f} "
+                        f"match_iou={int(matched_by_iou)} match_center={int(matched_by_center)} "
+                        f"stale={int(track.last_seen_frame < frame_idx)} hits={track.total_hits} bed_hits={track.bed_hits}"
+                    )
+                if not matched_by_iou and not matched_by_center:
+                    continue
+                candidate_key = (
+                    matched_by_iou,
+                    iou,
+                    -dist,
+                    float(track.total_hits),
+                )
+                if candidate_key > best_key:
+                    best_key = candidate_key
+                    best_track_id = track_id
+
+            if best_track_id is None:
+                if self.debug_tracking:
+                    debug_logs.extend(det_logs)
+                    debug_logs.append(
+                        f"TRACK_DEBUG frame={frame_idx} det={det.xyxy} no_active_match "
+                        f"threshold_iou={self.iou_threshold:.3f} threshold_center={max_center_dist:.1f}"
+                    )
+                continue
+
+            track = self.active_tracks[best_track_id]
+            self._apply_detection_to_track(track=track, det=det, frame_idx=frame_idx)
+            assigned_tracks.add(best_track_id)
+            matches.append((best_track_id, det, False))
+            if self.debug_tracking:
+                debug_logs.extend(det_logs)
+                debug_logs.append(
+                    f"TRACK_DEBUG frame={frame_idx} det={det.xyxy} matched_active_id={best_track_id}"
+                )
+        return matches, debug_logs
+
+    def _merge_track_state(self, dst: TrackState, src: TrackState) -> None:
+        dst.start_frame = min(dst.start_frame, src.start_frame)
+        dst.last_seen_frame = max(dst.last_seen_frame, src.last_seen_frame)
+        dst.total_hits += max(0, src.total_hits)
+        dst.bed_hits += max(0, src.bed_hits)
+        dst.stable_count = max(dst.stable_count, src.stable_count)
+        dst.max_area_seen = max(dst.max_area_seen, src.max_area_seen)
+        dst.last_area = max(dst.last_area, src.last_area)
+        dst.last_conf = max(dst.last_conf, src.last_conf)
+        if dst.track_state != "confirmed" and src.track_state == "confirmed":
+            dst.track_state = "confirmed"
+        if dst.confirmed_frame is None:
+            dst.confirmed_frame = src.confirmed_frame
+        elif src.confirmed_frame is not None:
+            dst.confirmed_frame = min(dst.confirmed_frame, src.confirmed_frame)
+        if dst.track_state != "confirmed" and dst.total_hits >= self.track_confirm_hits:
+            dst.track_state = "confirmed"
+            if dst.confirmed_frame is None:
+                dst.confirmed_frame = dst.last_seen_frame
+
+        if dst.best_candidate is None or (
+            src.best_candidate is not None and src.best_candidate.score > dst.best_candidate.score
+        ):
+            dst.best_candidate = src.best_candidate
+            if src.best_image_path:
+                dst.best_image_path = src.best_image_path
+
+        merged_top: list[CropCandidate] = []
+        seen_frames: set[int] = set()
+        for c in sorted(dst.top_candidates + src.top_candidates, key=lambda x: x.score, reverse=True):
+            if c.frame_idx in seen_frames:
+                continue
+            merged_top.append(c)
+            seen_frames.add(c.frame_idx)
+            if len(merged_top) >= self.keep_top_k:
+                break
+        dst.top_candidates = merged_top
+
+        vote_keep = max(len(dst.vote_candidates), len(src.vote_candidates), 1)
+        merged_votes = sorted(dst.vote_candidates + src.vote_candidates, key=lambda c: c.frame_idx)
+        if merged_votes:
+            dst.vote_candidates = merged_votes[-vote_keep:]
+            dst.last_vote_sample_frame = max(c.frame_idx for c in dst.vote_candidates)
+        elif src.last_vote_sample_frame is not None:
+            dst.last_vote_sample_frame = src.last_vote_sample_frame
+
+        fill_keep = max(len(dst.fill_candidates), len(src.fill_candidates), 1)
+        merged_fill = sorted(dst.fill_candidates + src.fill_candidates, key=lambda c: c.frame_idx)
+        if merged_fill:
+            dst.fill_candidates = merged_fill[-fill_keep:]
+            dst.last_fill_sample_frame = max(c.frame_idx for c in dst.fill_candidates)
+        elif src.last_fill_sample_frame is not None:
+            dst.last_fill_sample_frame = src.last_fill_sample_frame
+
+        if src.inference_runs:
+            existing_frames = {int(r.get("candidate_frame", -1)) for r in dst.inference_runs}
+            for run in src.inference_runs:
+                fidx = int(run.get("candidate_frame", -1))
+                if fidx in existing_frames:
+                    continue
+                dst.inference_runs.append(run)
+                existing_frames.add(fidx)
+        if dst.phase_results is None and src.phase_results is not None:
+            dst.phase_results = src.phase_results
+        if dst.best_image_path is None and src.best_image_path is not None:
+            dst.best_image_path = src.best_image_path
+
+    def _pick_keep_drop(self, a: TrackState, b: TrackState) -> tuple[TrackState, TrackState]:
+        def rank(t: TrackState) -> tuple[int, int, float, int, int]:
+            x1, y1, x2, y2 = t.raw_truck_box_xyxy
+            area = max(0, (x2 - x1) * (y2 - y1))
+            return (t.total_hits, t.bed_hits, t.last_conf, area, -t.track_id)
+
+        if rank(a) >= rank(b):
+            return a, b
+        return b, a
+
+    def _suppress_duplicate_tracks(
+        self,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> list[str]:
+        _frame_h, _frame_w = frame_shape
+        matched_ids = [
+            tid
+            for tid, t in self.active_tracks.items()
+            if t.matched_in_update and t.last_seen_frame == frame_idx
+        ]
+        if len(matched_ids) < 2:
+            return []
+
+        logs: list[str] = []
+        remove_ids: set[int] = set()
+        sorted_ids = sorted(matched_ids)
+        for i, a_id in enumerate(sorted_ids):
+            if a_id in remove_ids or a_id not in self.active_tracks:
+                continue
+            for b_id in sorted_ids[i + 1 :]:
+                if b_id in remove_ids or b_id not in self.active_tracks:
+                    continue
+                a = self.active_tracks[a_id]
+                b = self.active_tracks[b_id]
+                iou = iou_xyxy(a.raw_truck_box_xyxy, b.raw_truck_box_xyxy)
+                if iou < self.duplicate_iou_threshold:
+                    continue
+                keep, drop = self._pick_keep_drop(a, b)
+                self._merge_track_state(dst=keep, src=drop)
+                remove_ids.add(drop.track_id)
+                logs.append(
+                    f"DEDUP: merged duplicate active track ID={drop.track_id} into ID={keep.track_id} "
+                    f"(iou={iou:.3f})"
+                )
+
+        for tid in sorted(remove_ids):
+            self.active_tracks.pop(tid, None)
+            self._remove_lost_snapshot(tid)
+        return logs
+
+    def _find_exit_duplicate_track(
+        self,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> TrackState | None:
+        frame_h, frame_w = frame_shape
+        if not self._near_edge(det.xyxy, frame_w, frame_h):
+            return None
+
+        best_track = None
+        best_key = (-1.0, -1.0, float("-inf"))
+        for track in self.active_tracks.values():
+            if not track.is_confirmed:
+                continue
+            if track.last_seen_frame != frame_idx:
+                continue
+            if not self._near_edge(track.raw_truck_box_xyxy, frame_w, frame_h):
+                continue
+            truck_iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            bed_iou = 0.0
+            if det.bed_box_xyxy is not None and track.bed_box_xyxy is not None:
+                bed_iou = iou_xyxy(det.bed_box_xyxy, track.bed_box_xyxy)
+            if truck_iou < self.exit_duplicate_iou_threshold and bed_iou < self.exit_duplicate_bed_iou_threshold:
+                continue
+            candidate_key = (truck_iou, bed_iou, float(track.total_hits))
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_track = track
+        return best_track
+
+    def _find_active_duplicate_track(
+        self,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> TrackState | None:
+        frame_h, frame_w = frame_shape
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.active_match_center_dist_ratio * frame_diag
+        best_track = None
+        best_key = (-1.0, -1.0, float("-inf"), float("-inf"))
+        for track in self.active_tracks.values():
+            if not track.is_confirmed:
+                continue
+            if track.last_seen_frame != frame_idx:
+                continue
+            if self._near_edge(track.raw_truck_box_xyxy, frame_w, frame_h):
+                continue
+            truck_iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            overlap_ratio = overlap_over_min_area_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            cdist = center_distance(det.xyxy, track.raw_truck_box_xyxy)
+            bed_iou = 0.0
+            if det.bed_box_xyxy is not None and track.bed_box_xyxy is not None:
+                bed_iou = iou_xyxy(det.bed_box_xyxy, track.bed_box_xyxy)
+            if (
+                truck_iou < self.active_duplicate_iou_threshold
+                and bed_iou < self.active_duplicate_bed_iou_threshold
+                and overlap_ratio < 0.60
+                and cdist > max_center_dist
+            ):
+                continue
+            candidate_key = (truck_iou, bed_iou, overlap_ratio, -cdist)
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_track = track
+        return best_track
+
+    def _find_startup_duplicate_track(
+        self,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> TrackState | None:
+        if frame_idx > self.startup_duplicate_window_frames:
+            return None
+        frame_h, frame_w = frame_shape
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.startup_duplicate_center_dist_ratio * frame_diag
+        best_track = None
+        best_key = (-1.0, -1.0, float("-inf"), float("-inf"))
+        for track in self.active_tracks.values():
+            if track.last_seen_frame != frame_idx:
+                continue
+            truck_iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            bed_iou = 0.0
+            cdist = center_distance(det.xyxy, track.raw_truck_box_xyxy)
+            if det.bed_box_xyxy is not None and track.bed_box_xyxy is not None:
+                bed_iou = iou_xyxy(det.bed_box_xyxy, track.bed_box_xyxy)
+            overlap_ratio = overlap_over_min_area_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            if (
+                truck_iou < self.startup_duplicate_iou_threshold
+                and bed_iou < self.startup_duplicate_bed_iou_threshold
+                and overlap_ratio < self.startup_duplicate_overlap_ratio
+                and cdist > max_center_dist
+            ):
+                continue
+            candidate_key = (truck_iou, bed_iou, -cdist, float(track.total_hits))
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_track = track
+        return best_track
+
+    def _suppress_startup_parallel_tracks(
+        self,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> list[str]:
+        if frame_idx > self.startup_duplicate_window_frames:
+            return []
+        frame_h, frame_w = frame_shape
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.startup_duplicate_center_dist_ratio * frame_diag
+        active_ids = sorted(
+            tid for tid, t in self.active_tracks.items() if t.last_seen_frame == frame_idx
+        )
+        if len(active_ids) < 2:
+            return []
+
+        logs: list[str] = []
+        remove_ids: set[int] = set()
+        for i, a_id in enumerate(active_ids):
+            if a_id in remove_ids or a_id not in self.active_tracks:
+                continue
+            for b_id in active_ids[i + 1 :]:
+                if b_id in remove_ids or b_id not in self.active_tracks:
+                    continue
+                a = self.active_tracks[a_id]
+                b = self.active_tracks[b_id]
+                iou = iou_xyxy(a.raw_truck_box_xyxy, b.raw_truck_box_xyxy)
+                overlap_ratio = overlap_over_min_area_xyxy(a.raw_truck_box_xyxy, b.raw_truck_box_xyxy)
+                cdist = center_distance(a.raw_truck_box_xyxy, b.raw_truck_box_xyxy)
+                if (
+                    iou < self.startup_duplicate_iou_threshold
+                    and overlap_ratio < self.startup_duplicate_overlap_ratio
+                    and cdist > max_center_dist
+                ):
+                    continue
+                keep, drop = self._pick_keep_drop(a, b)
+                self._merge_track_state(dst=keep, src=drop)
+                remove_ids.add(drop.track_id)
+                logs.append(
+                    f"STARTUP_PARALLEL_SUPPRESS: merged ID={drop.track_id} into ID={keep.track_id} "
+                    f"(iou={iou:.3f}, overlap={overlap_ratio:.3f}, center_dist={cdist:.1f})"
+                )
+        for tid in sorted(remove_ids):
+            self.active_tracks.pop(tid, None)
+            self._remove_lost_snapshot(tid)
+        return logs
+
+    def update(
+        self,
+        detections: list[Detection],
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> tuple[dict[int, TrackState], list[TrackState], list[str]]:
+        frame_h, frame_w = frame_shape
+        merge_logs: list[str] = []
+        matches, match_debug_logs = self._match_detections_to_tracks(
+            detections=detections,
+            frame_idx=frame_idx,
+            frame_shape=frame_shape,
+        )
+        merge_logs.extend(match_debug_logs)
+        matched_boxes = {det.xyxy for _, det, _ in matches}
+
+        for det in sorted(detections, key=lambda d: d.conf, reverse=True):
+            if det.xyxy in matched_boxes:
+                continue
+            recovered_track, recover_iou, recover_dist = self._try_recover_stale_active_track(
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+                assigned_tracks={track_id for track_id, *_rest in matches},
+            )
+            if recovered_track is not None:
+                self._apply_detection_to_track(track=recovered_track, det=det, frame_idx=frame_idx)
+                matches.append((recovered_track.track_id, det, True))
+                merge_logs.append(
+                    f"STALE_ACTIVE_RECOVER: reattached detection to ID={recovered_track.track_id} "
+                    f"(iou={recover_iou:.3f}, center_dist={recover_dist:.1f})"
+                )
+                continue
+            elif self.debug_tracking:
+                merge_logs.append(
+                    f"TRACK_DEBUG frame={frame_idx} det={det.xyxy} stale_recover_failed"
+                )
+            blocking_midscene_track = self._find_midscene_blocking_track(
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+            )
+            if blocking_midscene_track is not None:
+                merge_logs.append(
+                    f"MIDSCENE_NEW_SUPPRESS: skipped new track as similar to active ID={blocking_midscene_track.track_id} "
+                    f"(det={det.xyxy})"
+                )
+                continue
+            if self.new_track_ignore_lower_ratio > 0.0:
+                cutoff_y = float(frame_h) * (1.0 - self.new_track_ignore_lower_ratio)
+                if det.bed_box_xyxy is not None:
+                    _bx, by = center_xyxy(det.bed_box_xyxy)
+                    if by >= cutoff_y:
+                        merge_logs.append(
+                            f"LOWER_ZONE_SUPPRESS: skipped new track in lower "
+                            f"{self.new_track_ignore_lower_ratio:.2f} zone (bed_center_y={by:.1f}, cutoff={cutoff_y:.1f})"
+                        )
+                        continue
+                else:
+                    _tx, ty = center_xyxy(det.xyxy)
+                    if ty >= cutoff_y:
+                        merge_logs.append(
+                            f"LOWER_ZONE_SUPPRESS: skipped new track in lower "
+                            f"{self.new_track_ignore_lower_ratio:.2f} zone (truck_center_y={ty:.1f}, cutoff={cutoff_y:.1f})"
+                        )
+                        continue
+            startup_dup_track = self._find_startup_duplicate_track(
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+            )
+            if startup_dup_track is not None:
+                merge_logs.append(
+                    f"STARTUP_DUP_SUPPRESS: skipped new track as startup duplicate of ID={startup_dup_track.track_id}"
+                )
+                continue
+            active_dup_track = self._find_active_duplicate_track(
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+            )
+            if active_dup_track is not None:
+                merge_logs.append(
+                    f"ACTIVE_DUP_SUPPRESS: skipped new track as duplicate of active ID={active_dup_track.track_id}"
+                )
+                continue
+            exit_dup_track = self._find_exit_duplicate_track(
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+            )
+            if exit_dup_track is not None:
+                merge_logs.append(
+                    f"EXIT_DUP_SUPPRESS: skipped new track near edge as duplicate of ID={exit_dup_track.track_id}"
+                )
+                continue
+            lost_item, m_iou, m_dist = self._try_merge_with_recently_lost(
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+            )
+            if lost_item is not None and lost_item.track_id not in self.active_tracks:
+                track = self._create_track(det=det, frame_idx=frame_idx, track_id=lost_item.track_id)
+                track.start_frame = int(lost_item.start_frame)
+                track.total_hits = max(1, int(lost_item.total_hits) + 1)
+                track.bed_hits = max(0, int(lost_item.bed_hits) + (1 if det.bed_box_xyxy is not None else 0))
+                track.track_state = str(lost_item.track_state)
+                track.confirmed_frame = lost_item.confirmed_frame
+                track.max_area_seen = max(int(lost_item.max_area_seen), track.max_area_seen)
+                track.last_area = max(int(lost_item.last_area), track.last_area)
+                track.best_candidate = lost_item.best_candidate
+                track.vote_candidates = list(lost_item.vote_candidates)
+                track.last_vote_sample_frame = lost_item.last_vote_sample_frame
+                track.fill_candidates = list(lost_item.fill_candidates)
+                track.last_fill_sample_frame = lost_item.last_fill_sample_frame
+                track.phase_results = lost_item.phase_results
+                track.best_image_path = lost_item.best_image_path
+                track.matched_in_update = True
+                self._update_track_state(track, frame_idx=frame_idx)
+                self._remove_lost_snapshot(lost_item.track_id)
+                self.total_merges += 1
+                gap = frame_idx - lost_item.last_seen_frame
+                merge_logs.append(
+                    f"MERGE: new temp track merged into ID={lost_item.track_id} "
+                    f"(gap={gap}, iou={m_iou:.3f}, center_dist={m_dist:.1f})"
+                )
+                matches.append((track.track_id, det, True))
+                continue
+
+            new_track = self._create_track(det=det, frame_idx=frame_idx, track_id=None)
+            new_track.matched_in_update = True
+            matches.append((new_track.track_id, det, True))
+            if self.debug_tracking:
+                merge_logs.append(
+                    f"TRACK_DEBUG frame={frame_idx} det={det.xyxy} created_new_id={new_track.track_id}"
+                )
+
+        merge_logs.extend(self._suppress_duplicate_tracks(frame_idx=frame_idx, frame_shape=frame_shape))
+        merge_logs.extend(self._suppress_startup_parallel_tracks(frame_idx=frame_idx, frame_shape=frame_shape))
+
+        for track in self.active_tracks.values():
+            if track.matched_in_update:
+                continue
+            track.missed_count = max(0, frame_idx - track.last_seen_frame)
+            if track.missed_count > 0:
+                self._upsert_lost_snapshot(track)
+
+        finalized: list[TrackState] = []
+        remove_ids: list[int] = []
+        for track_id, track in self.active_tracks.items():
+            if track.missed_count < self.missed_M:
+                continue
+            if self.edge_guard and (not self._near_edge(track.truck_box_xyxy, frame_w, frame_h)):
+                continue
+            finalized.append(track)
+            remove_ids.append(track_id)
+
+        for track_id in remove_ids:
+            self.active_tracks.pop(track_id, None)
+            self._remove_lost_snapshot(track_id)
+
+        self._prune_lost(frame_idx)
+        return self.active_tracks, finalized, merge_logs
+
+    def add_candidate(self, track_id: int, candidate: CropCandidate) -> bool:
+        track = self.active_tracks.get(track_id)
+        if track is None:
+            return False
+
+        old_best_score = track.best_candidate.score if track.best_candidate is not None else float("-inf")
+        if track.best_candidate is None or candidate.score > track.best_candidate.score:
+            track.best_candidate = candidate
+
+        existing_frames = {c.frame_idx for c in track.top_candidates}
+        if candidate.frame_idx in existing_frames:
+            for i, c in enumerate(track.top_candidates):
+                if c.frame_idx == candidate.frame_idx and candidate.score > c.score:
+                    track.top_candidates[i] = candidate
+            track.top_candidates = sorted(track.top_candidates, key=lambda c: c.score, reverse=True)
+        else:
+            track.top_candidates.append(candidate)
+            track.top_candidates = sorted(track.top_candidates, key=lambda c: c.score, reverse=True)[: self.keep_top_k]
+
+        new_best_score = track.best_candidate.score if track.best_candidate is not None else float("-inf")
+        return new_best_score > old_best_score
+
+    def add_vote_candidate(
+        self,
+        track_id: int,
+        candidate: CropCandidate,
+        sample_every_frames: int = 5,
+        max_samples: int = 80,
+    ) -> bool:
+        track = self.active_tracks.get(track_id)
+        if track is None:
+            return False
+
+        stride = max(1, int(sample_every_frames))
+        if track.last_vote_sample_frame is not None:
+            if (candidate.frame_idx - track.last_vote_sample_frame) < stride:
+                return False
+
+        track.vote_candidates.append(candidate)
+        track.last_vote_sample_frame = int(candidate.frame_idx)
+        keep = max(1, int(max_samples))
+        if len(track.vote_candidates) > keep:
+            track.vote_candidates = track.vote_candidates[-keep:]
+        return True
+
+    def candidate_already_inferred(self, track: TrackState, frame_idx: int) -> bool:
+        for run in track.inference_runs:
+            if int(run.get("candidate_frame", -1)) == int(frame_idx):
+                return True
+        return False
+
+    def add_fill_candidate(
+        self,
+        track_id: int,
+        candidate: CropCandidate,
+    ) -> bool:
+        track = self.active_tracks.get(track_id)
+        if track is None:
+            return False
+
+        existing_frames = {c.frame_idx for c in track.fill_candidates}
+        if candidate.frame_idx in existing_frames:
+            for i, c in enumerate(track.fill_candidates):
+                if c.frame_idx == candidate.frame_idx and candidate.score > c.score:
+                    track.fill_candidates[i] = candidate
+                    track.last_fill_sample_frame = int(candidate.frame_idx)
+                    return True
+            return False
+
+        track.fill_candidates.append(candidate)
+        track.fill_candidates = sorted(track.fill_candidates, key=lambda c: c.frame_idx)
+        track.last_fill_sample_frame = int(candidate.frame_idx)
+        return True
