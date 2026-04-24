@@ -618,13 +618,6 @@ def _merge_size_result_into_event(event: dict[str, Any], size_event: SizeEvent |
 
 
 def _should_emit_merged_event(event: dict[str, Any]) -> tuple[bool, str]:
-    coverage = event.get("coverage") or {}
-    cover_status = str(coverage.get("pred_label") or "")
-    fill_estimation = event.get("fill_estimation")
-
-    if cover_status == "uncovered_or_partial" and fill_estimation is None:
-        return False, "missing_size_result_for_uncovered_event"
-
     return True, ""
 
 
@@ -1426,8 +1419,14 @@ def run_stream_event(
             size_event = size_pipeline.force_finalize_ready_trigger_match(event)
         if size_event is None and size_pipeline is not None and final_flush:
             size_event = size_pipeline.force_finalize_best_match(event)
-        if size_event is None and size_pipeline is not None and not final_flush:
-            return None
+        if size_event is None and size_pipeline is not None:
+            if not final_flush:
+                return None
+            logger.info(
+                "Dropping unresolved delayed event_id=%s at final flush (no matched size result)",
+                event.get("event_id"),
+            )
+            return {}
         merged_event = _merge_size_result_into_event(event, size_event)
         should_emit, drop_reason = _should_emit_merged_event(merged_event)
         if not should_emit:
@@ -1555,13 +1554,6 @@ def run_stream_event(
                 if tx2 <= tx1 or ty2 <= ty1:
                     continue
                 raw_tx1, raw_ty1, raw_tx2, raw_ty2 = clamp_xyxy(*track.raw_truck_box_xyxy, frame_w, frame_h)
-                if size_pipeline is not None and size_pipeline.has_trigger_ready_for_bbox(
-                    (raw_tx1, raw_ty1, raw_tx2, raw_ty2),
-                    frame_shape=(frame_h, frame_w),
-                ):
-                    track.size_trigger_ready_seen = True
-                if not track.size_trigger_ready_seen:
-                    continue
                 truck_crop = frame[raw_ty1:raw_ty2, raw_tx1:raw_tx2]
                 crop = frame[by1:by2, bx1:bx2]
                 if crop is None or crop.size == 0:
@@ -1656,12 +1648,6 @@ def run_stream_event(
                         track.track_state,
                         track.total_hits,
                         track.bed_hits,
-                    )
-                    continue
-                if not track.size_trigger_ready_seen:
-                    logger.info(
-                        "Dropping pre-trigger track %s (size trigger was never reached)",
-                        track.track_id,
                     )
                     continue
                 if last_frame_shape is not None and int(track.truck_box_xyxy[3]) < int(last_frame_shape[0] * 0.5):
@@ -1777,13 +1763,6 @@ def run_stream_event(
                     )
                     tracker.active_tracks.pop(track_id, None)
                     continue
-                if not track.size_trigger_ready_seen:
-                    logger.info(
-                        "Dropping pre-trigger track %s at EOF (size trigger was never reached)",
-                        track.track_id,
-                    )
-                    tracker.active_tracks.pop(track_id, None)
-                    continue
                 if last_frame_shape is not None and int(track.truck_box_xyxy[3]) < int(last_frame_shape[0] * 0.5):
                     logger.info(
                         "Dropping upper-half-ending track %s at EOF (truck_bottom=%s, frame_half=%s)",
@@ -1826,28 +1805,6 @@ def run_stream_event(
                     vote_every_n_frames=vote_every_n_frames,
                     logger=logger,
                 )
-                dedup_target = None
-                if event_dedup_enable:
-                    dedup_target = _find_dedup_target_event(
-                        candidate_event=event,
-                        recent_events=recent_emitted_events,
-                        frame_shape=last_frame_shape,
-                        window_frames=event_dedup_window_frames,
-                        iou_threshold=event_dedup_iou_threshold,
-                        center_dist_ratio=event_dedup_center_dist_ratio,
-                    )
-                if dedup_target is not None:
-                    prev_event, d_iou, d_dist = dedup_target
-                    events_deduped += 1
-                    logger.info(
-                        "EVENT_DEDUP dropped EOF event_id=%s as duplicate of event_id=%s (iou=%.3f, center_dist=%.1f)",
-                        event.get("event_id"),
-                        prev_event.get("event_id"),
-                        d_iou,
-                        d_dist,
-                    )
-                    tracker.active_tracks.pop(track_id, None)
-                    continue
                 emit_event_with_current_size_result(event, final_flush=True)
                 tracker.active_tracks.pop(track_id, None)
 
