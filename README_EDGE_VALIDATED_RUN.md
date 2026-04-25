@@ -1,16 +1,15 @@
-# Edge Validated Run
+# Edge Validated Run (Orin Nano 8GB)
 
-This file is the edge-deployment equivalent of the local validated run guide.
+This is the validated edge run guide for NVIDIA Jetson Orin Nano 8GB.
 
-Its purpose is simple:
-- pull the `gpu-friendly` branches of both repos
-- place them in the expected side-by-side layout
-- install only the non-Torch Python dependencies in repo-local environments
-- run the pipeline with a storage-light, GPU-usable command on NVIDIA Orin Nano
+It documents the current integrated behavior of this repo:
+- repo 1 (`truckPipline_April_24`): compliance/event pipeline (Phase 1..5)
+- repo 2 (`truck_size_2`): fill estimation
+- merged output: one event line per finalized truck with compliance + fill result
 
-## Expected Layout
+## 1) Target Deployment Layout
 
-Use this exact folder structure on the edge device:
+Use this side-by-side layout:
 
 ```text
 ~/truckpipline_with_size/
@@ -18,18 +17,17 @@ Use this exact folder structure on the edge device:
   repo_size/    -> truck_size_2
 ```
 
-The `repo` code auto-discovers the size models from:
-- local `weights/`
-- sibling `../repo_size`
+Why this layout matters:
+- `repo` auto-discovers size models from local `weights/` and sibling `../repo_size`.
+- integrated stream-event mode expects the second repo models to be reachable.
 
-## Required Branches
+## 2) Branches To Use
 
-Pull these branches:
+Use `gpu-friendly` for both repos:
+- `truckPipline_April_24`: `gpu-friendly`
+- `truck_size_2`: `gpu-friendly`
 
-- main repo: `gpu-friendly`
-- size repo: `gpu-friendly`
-
-## Clone Commands
+Clone:
 
 ```bash
 mkdir -p ~/truckpipline_with_size
@@ -39,23 +37,26 @@ git clone --branch gpu-friendly https://github.com/mohammadalkhawaldah/truckPipl
 git clone --branch gpu-friendly https://github.com/mohammadalkhawaldah/truck_size_2.git repo_size
 ```
 
-## Jetson / Orin Nano Assumption
+## 3) Jetson Orin Nano 8GB Prerequisites
 
-Before using the repo setup scripts, the device should already have:
+Before repo setup, the device should already have:
 - JetPack installed
-- NVIDIA-provided `torch` and `torchvision` appropriate for the device
-- OpenCV available from the Jetson environment you trust
+- NVIDIA-compatible `torch` / `torchvision`
+- working OpenCV in your Jetson environment
 
-The repo Jetson requirements intentionally do not pin or install:
-- `torch`
-- `torchvision`
-- `opencv-python`
+Important: `requirements.jetson.txt` in this repo intentionally installs only:
+- `ultralytics==8.3.173`
+- `numpy==1.26.4`
+- `Pillow==10.4.0`
+- `pandas==2.2.3`
+- `PyYAML==6.0.2`
+- `tqdm==4.66.5`
 
-Those packages are usually device-specific on Jetson and should come from the platform setup.
+It intentionally does not install/pin `torch`, `torchvision`, or `opencv-python`.
 
-## Setup Commands
+## 4) Setup (Both Repos)
 
-Run both setup scripts:
+Run the setup helper in each repo:
 
 ```bash
 cd ~/truckpipline_with_size/repo
@@ -65,60 +66,85 @@ cd ~/truckpipline_with_size/repo_size
 bash scripts/setup_orin_nano.sh
 ```
 
-## Edge Run Command
-
-Recommended main run command from the main repo:
+Sanity check CUDA visibility in the main repo venv:
 
 ```bash
 cd ~/truckpipline_with_size/repo
-bash scripts/run_orin_stream_event.sh /absolute/path/to/video.mp4
+.venv_orin/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-That command currently expands to a storage-light stream-event run with:
+Expected on Orin: `torch.cuda.is_available()` prints `True`.
 
-- `--mode stream_event`
-- `--every_n 1`
-- `--show 0`
-- `--size-show 0`
-- `--preview-scale 0.25`
-- `--size-preview-every 999999`
-- `--summary-only 1`
-- `--non-interactive-model-select`
-- `--device auto`
+## 5) Validated Edge Run Command
 
-## Important Edge Rules
-
-For the edge pull, do not enable extra artifact saving unless you are debugging.
-
-By default this branch keeps edge storage cleaner because:
-- event artifacts are disabled by default
-- size artifacts are disabled by default
-- the size-side helper defaults to `--save-frames 0`
-
-So a normal edge run should not save extra photos or videos.
-
-## Optional Standalone Size Repo Check
-
-If you want to test only the second repo on the edge:
+Run from the main repo:
 
 ```bash
-cd ~/truckpipline_with_size/repo_size
-bash scripts/run_auto_select_orin.sh /absolute/path/to/video.mp4 --write-summary-csv
+cd ~/truckpipline_with_size/repo
+.venv_orin/bin/python main.py \
+  --video-path /absolute/path/to/video.mp4 \
+  --mode stream_event \
+  --every_n 1 \
+  --show 0 \
+  --size-show 0 \
+  --preview-scale 0.25 \
+  --size-preview-every 999999 \
+  --summary-only 1 \
+  --non-interactive-model-select
 ```
 
-## What To Verify
+### Effective behavior of this command
 
-After an edge run:
+- stream-event mode with integrated size tracking is enabled
+- runtime device resolves automatically inside pipeline code (`auto -> cuda if available`)
+- event and size artifact saving remain disabled by default
+- output is optimized for edge storage (summary-first, no heavy preview windows)
 
-1. Confirm the process is using the GPU-enabled device path rather than CPU-only forced inference.
-2. Confirm terminal output shows emitted event lines.
-3. Confirm no unexpected image-dump folders are growing unless you explicitly enabled artifact saving.
+## 6) Note About `run_orin_stream_event.sh`
 
-## Summary
+The helper script is still useful, but if your local copy includes `--device auto` in the command line, that can fail with current `main.py` CLI parsing.
 
-For the smoothest edge pull:
-- use the `gpu-friendly` branch in both repos
-- keep the side-by-side `repo` / `repo_size` layout
-- use the provided Jetson setup scripts
-- use the provided `run_orin_stream_event.sh` command
-- do not turn on extra artifact-saving flags unless needed for debugging
+Safe options:
+1. Use the direct validated command above.
+2. Or edit `scripts/run_orin_stream_event.sh` and remove `--device auto`.
+
+## 7) Outputs You Should See
+
+Primary files:
+- `outputs/events.jsonl`
+- `logs/stream_event.log`
+
+Console behavior with `--summary-only 1`:
+- concise event/final stats lines only (not full per-frame debug chatter)
+
+Artifacts (disabled by default):
+- event debug images: off unless `--save-event-artifacts 1`
+- size candidate/winner images: off unless `--save-size-artifacts 1`
+
+## 8) Quick Validation Checklist
+
+After one test video run:
+
+1. Confirm run starts without model-path errors.
+2. Confirm events are emitted in terminal output.
+3. Confirm `outputs/events.jsonl` is updated.
+4. Confirm no unexpected image dump folders grow (unless explicitly enabled).
+5. Confirm no CPU-only fallback warning appears when CUDA is available.
+
+## 9) If Results Are Wrong or Missing
+
+Check these first:
+- repo layout is exactly `repo` + `repo_size` side by side
+- both repos are on `gpu-friendly`
+- `.pt` model files exist under `weights/` and/or `../repo_size`
+- Jetson torch build is CUDA-enabled in `.venv_orin`
+- your video path is absolute and readable
+
+## 10) Summary
+
+For Orin Nano 8GB edge deployment:
+- keep the side-by-side repo layout
+- use `gpu-friendly` on both repos
+- use Jetson-native torch/torchvision/OpenCV
+- run the validated stream-event command from `repo`
+- keep artifact-saving disabled unless debugging
