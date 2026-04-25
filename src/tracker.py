@@ -551,18 +551,21 @@ class IoUTracker:
         frame_h, frame_w = frame_shape
         frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
         max_center_dist = self.merge_center_dist_ratio * frame_diag
-        fallback_center_dist = max(max_center_dist, 0.35 * frame_diag)
+        strict_center_dist = max(24.0, min(max_center_dist, 0.12 * frame_diag))
+        min_stale_iou_for_center = max(0.10, self.merge_iou_threshold * 0.5)
 
         best_track = None
         best_iou = -1.0
         best_dist = float("inf")
-        best_key = (False, False, -1.0, float("-inf"), float("-inf"))
+        best_key = (False, False, -1.0, -1.0, float("-inf"), float("-inf"))
         stale_candidates: list[tuple[TrackState, float, float]] = []
 
         for track_id, track in self.active_tracks.items():
             if track_id in assigned_tracks:
                 continue
             if track.last_seen_frame >= frame_idx:
+                continue
+            if (frame_idx - track.last_seen_frame) > self.merge_window_frames:
                 continue
 
             iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
@@ -573,8 +576,8 @@ class IoUTracker:
                 bed_iou = iou_xyxy(det.bed_box_xyxy, track.bed_box_xyxy)
 
             matched_by_iou = iou >= self.merge_iou_threshold
-            matched_by_center = dist <= max_center_dist
-            matched_by_bed = bed_iou >= self.active_duplicate_bed_iou_threshold
+            matched_by_center = dist <= strict_center_dist and iou >= min_stale_iou_for_center
+            matched_by_bed = bed_iou >= self.active_duplicate_bed_iou_threshold and dist <= max_center_dist
             if not matched_by_iou and not matched_by_center and not matched_by_bed:
                 continue
 
@@ -582,6 +585,7 @@ class IoUTracker:
                 track.is_confirmed,
                 matched_by_iou,
                 bed_iou,
+                iou,
                 -dist,
                 float(track.total_hits),
             )
@@ -593,21 +597,6 @@ class IoUTracker:
 
         if best_track is not None:
             return best_track, best_iou, best_dist
-
-        current_frame_confirmed_tracks = [
-            track
-            for track in self.active_tracks.values()
-            if track.is_confirmed and track.last_seen_frame == frame_idx
-        ]
-        confirmed_stale = [
-            (track, iou, dist)
-            for track, iou, dist in stale_candidates
-            if track.is_confirmed and (frame_idx - track.last_seen_frame) <= self.merge_window_frames
-        ]
-        if len(current_frame_confirmed_tracks) == 0 and len(confirmed_stale) == 1:
-            track, iou, dist = confirmed_stale[0]
-            if dist <= fallback_center_dist:
-                return track, iou, dist
 
         return best_track, best_iou, best_dist
 

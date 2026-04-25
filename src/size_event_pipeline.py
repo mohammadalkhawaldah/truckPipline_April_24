@@ -718,9 +718,18 @@ class OnlineSizeEventPipeline:
                 track.threshold_reached = True
             if not track.threshold_reached:
                 continue
-            crop_bgr = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]].copy()
             image_path = save_frame(self.output_dir, track_id, frame_index, frame, bbox) if self.save_artifacts else None
-            detection = SizeDetection(bbox, confidence, score, frame_index, timestamp_sec, image_path, crop_bgr=crop_bgr)
+            x1, y1, x2, y2 = bbox
+            crop_bgr = frame[y1:y2, x1:x2].copy()
+            detection = SizeDetection(
+                bbox,
+                confidence,
+                score,
+                frame_index,
+                timestamp_sec,
+                image_path,
+                crop_bgr=crop_bgr,
+            )
             track.history.append(detection)
             if track.best_detection is None or score > track.best_detection.score:
                 track.best_detection = detection
@@ -752,9 +761,18 @@ class OnlineSizeEventPipeline:
             )
             update_track_direction(new_track, bbox, frame_index, self.current_frame_height)
             if new_track.direction_label != "outgoing" and threshold_reached:
-                crop_bgr = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]].copy()
                 image_path = save_frame(self.output_dir, self.next_track_id, frame_index, frame, bbox) if self.save_artifacts else None
-                detection = SizeDetection(bbox, confidence, score, frame_index, timestamp_sec, image_path, crop_bgr=crop_bgr)
+                x1, y1, x2, y2 = bbox
+                crop_bgr = frame[y1:y2, x1:x2].copy()
+                detection = SizeDetection(
+                    bbox,
+                    confidence,
+                    score,
+                    frame_index,
+                    timestamp_sec,
+                    image_path,
+                    crop_bgr=crop_bgr,
+                )
                 history = [detection]
                 best_detection = detection
             new_track.history = history
