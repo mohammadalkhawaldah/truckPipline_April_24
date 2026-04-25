@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import torch
 from ultralytics import YOLO
 
 from src import config
@@ -26,6 +27,7 @@ class ModelBundle:
     cls2: YOLO
     cls3: YOLO
     seg: YOLO
+    device: str
 
     detect_names: dict[int, str]
     cls1_names: dict[int, str]
@@ -730,11 +732,12 @@ def _load_models(
     cls2_model_path: Path,
     cls3_model_path: Path,
     seg_model_path: Path,
+    device: str,
     logger,
     bed_class_ids: list[int] | None,
     truck_class_ids: list[int] | None,
 ) -> ModelBundle:
-    logger.info("Loading stream models on CPU")
+    logger.info("Loading stream models on device=%s", device)
     detect = YOLO(str(detect_model_path))
     cls1 = YOLO(str(cls1_model_path))
     cls2 = YOLO(str(cls2_model_path))
@@ -779,6 +782,7 @@ def _load_models(
         cls2=cls2,
         cls3=cls3,
         seg=seg,
+        device=device,
         detect_names=detect_names,
         cls1_names=cls1_names,
         cls2_names=cls2_names,
@@ -1169,6 +1173,7 @@ def run_stream_event(
     truck_class_ids: list[int] | None = None,
     show_preview: bool = False,
     size_show_preview: bool | None = None,
+    device: str = "auto",
     preview_scale: float = 1.0,
     preview_fullscreen: bool = False,
     summary_only: bool = False,
@@ -1202,6 +1207,11 @@ def run_stream_event(
     debug_tracking: bool = False,
     max_frames: int | None = None,
 ) -> bool:
+    resolved_device = str(device or "auto").strip().lower()
+    if resolved_device in {"", "auto"}:
+        resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+    elif resolved_device.startswith("cuda") and not torch.cuda.is_available():
+        resolved_device = "cpu"
     if size_show_preview is None:
         size_show_preview = show_preview
     size_preview_every_samples = max(1, int(size_preview_every_samples))
@@ -1299,6 +1309,7 @@ def run_stream_event(
         cls2_model_path=cls2_path,
         cls3_model_path=cls3_path,
         seg_model_path=seg_path,
+        device=resolved_device,
         logger=logger,
         bed_class_ids=bed_class_ids if bed_class_ids is not None else config.BED_CLASS_IDS,
         truck_class_ids=truck_class_ids if truck_class_ids is not None else config.TRUCK_CLASS_IDS,
