@@ -421,7 +421,7 @@ def _score_size_truck_detect_candidate(path: Path) -> int:
 
 
 def _auto_discover_size_truck_model_path() -> Path | None:
-    search_roots = [PROJECT_ROOT, WEIGHTS_DIR, SIBLING_TRUCK_SIZE_DIR]
+    search_roots = [PROJECT_ROOT, WEIGHTS_DIR]
     pt_files: list[Path] = []
     for root in search_roots:
         if not root.exists():
@@ -445,7 +445,7 @@ def _auto_discover_size_truck_model_path() -> Path | None:
 
 
 def _auto_discover_size_seg_model_path() -> Path | None:
-    search_roots = [PROJECT_ROOT, WEIGHTS_DIR, SIBLING_TRUCK_SIZE_DIR]
+    search_roots = [PROJECT_ROOT, WEIGHTS_DIR]
     pt_files: list[Path] = []
     for root in search_roots:
         if not root.exists():
