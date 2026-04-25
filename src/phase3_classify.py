@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import torch
 from ultralytics import YOLO
 
 from src import config
@@ -272,10 +273,11 @@ def run_phase3(
     failures: list[str] = []
     rows: list[dict[str, Any]] = []
     predictions: list[Phase3Prediction] = []
+    inference_device = "cuda" if torch.cuda.is_available() else "cpu"
 
     for crop_path in sampled:
         image_bgr = load_image_bgr(crop_path)
-        result = model.predict(source=str(crop_path), device="cpu", verbose=False)[0]
+        result = model.predict(source=str(crop_path), device=inference_device, verbose=False)[0]
         if result.probs is None:
             failures.append(f"{crop_path.name}: classification probabilities are missing.")
             continue

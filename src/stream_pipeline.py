@@ -646,7 +646,7 @@ def _should_emit_merged_event(event: dict[str, Any]) -> tuple[bool, str]:
 def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg_conf_threshold: float) -> dict[str, Any]:
     crop = candidate.crop_bgr
 
-    cls1_result = models.cls1.predict(source=crop, device="cpu", verbose=False)[0]
+    cls1_result = models.cls1.predict(source=crop, device=models.device, verbose=False)[0]
     cls1_idx = int(cls1_result.probs.top1)
     cls1_conf = float(cls1_result.probs.top1conf.item())
     cls1_label = models.cls1_names.get(cls1_idx, f"class_{cls1_idx}")
@@ -668,7 +668,7 @@ def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg
     violation = False
 
     if is_fully_covered:
-        cls2_result = models.cls2.predict(source=crop, device="cpu", verbose=False)[0]
+        cls2_result = models.cls2.predict(source=crop, device=models.device, verbose=False)[0]
         cls2_idx = int(cls2_result.probs.top1)
         cls2_conf = float(cls2_result.probs.top1conf.item())
         cls2_label = models.cls2_names.get(cls2_idx, f"class_{cls2_idx}")
@@ -684,7 +684,7 @@ def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg
         }
 
         if is_irregular:
-            cls3_result = models.cls3.predict(source=crop, device="cpu", verbose=False)[0]
+            cls3_result = models.cls3.predict(source=crop, device=models.device, verbose=False)[0]
             cls3_idx = int(cls3_result.probs.top1)
             cls3_conf = float(cls3_result.probs.top1conf.item())
             cls3_label = models.cls3_names.get(cls3_idx, f"class_{cls3_idx}")
@@ -709,7 +709,7 @@ def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg
         else:
             violation = False
     else:
-        seg_result = models.seg.predict(source=crop, device="cpu", conf=seg_conf_threshold, verbose=False)[0]
+        seg_result = models.seg.predict(source=crop, device=models.device, conf=seg_conf_threshold, verbose=False)[0]
         segmentation = _parse_segmentation(seg_result, models.seg_names)
         violation = True
 
@@ -1587,7 +1587,7 @@ def run_stream_event(
             detect_frame = frame[:, roi_x1:roi_x2]
 
             detection_frames += 1
-            detect_result = models.detect.predict(source=detect_frame, device="cpu", conf=detect_conf, verbose=False)[0]
+            detect_result = models.detect.predict(source=detect_frame, device=models.device, conf=detect_conf, verbose=False)[0]
             detections = _extract_anchor_detections(
                 result=detect_result,
                 names=models.detect_names,

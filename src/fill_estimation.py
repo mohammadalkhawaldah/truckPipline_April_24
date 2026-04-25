@@ -4,6 +4,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 from src import config
@@ -77,6 +78,7 @@ def _run_size_segmentation(
     size_model,
     size_names: dict[int, str],
     seg_conf_threshold: float = config.SIZE_SEG_CONF_THRESHOLD,
+    device: str | None = None,
     box_class_names: list[str] | None = None,
     content_class_names: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -99,9 +101,10 @@ def _run_size_segmentation(
         for x in (content_class_names if content_class_names is not None else config.SIZE_CONTENT_CLASS_NAMES)
     }
 
+    inference_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     seg_result = size_model.predict(
         source=truck_crop_bgr,
-        device="cpu",
+        device=inference_device,
         conf=float(seg_conf_threshold),
         verbose=False,
     )[0]
@@ -182,6 +185,7 @@ def estimate_fill_for_truck_crop(
     size_model,
     size_names: dict[int, str],
     seg_conf_threshold: float = config.SIZE_SEG_CONF_THRESHOLD,
+    device: str | None = None,
     box_class_names: list[str] | None = None,
     content_class_names: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -190,6 +194,7 @@ def estimate_fill_for_truck_crop(
         size_model=size_model,
         size_names=size_names,
         seg_conf_threshold=seg_conf_threshold,
+        device=device,
         box_class_names=box_class_names,
         content_class_names=content_class_names,
     )
@@ -203,6 +208,7 @@ def render_fill_overlay_for_truck_crop(
     size_model,
     size_names: dict[int, str],
     seg_conf_threshold: float = config.SIZE_SEG_CONF_THRESHOLD,
+    device: str | None = None,
     box_class_names: list[str] | None = None,
     content_class_names: list[str] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
@@ -211,6 +217,7 @@ def render_fill_overlay_for_truck_crop(
         size_model=size_model,
         size_names=size_names,
         seg_conf_threshold=seg_conf_threshold,
+        device=device,
         box_class_names=box_class_names,
         content_class_names=content_class_names,
     )

@@ -9,6 +9,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 from src import config
@@ -263,10 +264,11 @@ def run_phase5(
     failures: list[str] = []
     rows: list[dict[str, Any]] = []
     predictions: list[Phase5Prediction] = []
+    inference_device = "cuda" if torch.cuda.is_available() else "cpu"
 
     for crop_path in sampled:
         image_bgr = load_image_bgr(crop_path)
-        result = model.predict(source=str(crop_path), device="cpu", conf=conf_thr, verbose=False)[0]
+        result = model.predict(source=str(crop_path), device=inference_device, conf=conf_thr, verbose=False)[0]
 
         overlay = result.plot()
         overlay_path = phase5_output_dir / f"{crop_path.stem}_seg.jpg"

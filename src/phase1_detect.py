@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import torch
 from ultralytics import YOLO
 
 from src import config
@@ -384,7 +385,7 @@ def run_phase1(
         resolved_size_seg_model_path = config.SIZE_SEG_MODEL_PATH
 
     if resolved_size_seg_model_path is not None and resolved_size_seg_model_path.exists():
-        logger.info("Loading truck-size segmentation model on CPU: %s", resolved_size_seg_model_path)
+        logger.info("Loading truck-size segmentation model: %s", resolved_size_seg_model_path)
         size_model = load_size_seg_model(resolved_size_seg_model_path)
         size_names = _names_to_dict(size_model.names)
     else:
@@ -420,11 +421,13 @@ def run_phase1(
     summary_rows: list[dict[str, Any]] = []
     failures: list[str] = []
 
+    inference_device = "cuda" if torch.cuda.is_available() else "cpu"
+
     for image_path in sampled:
         image_bgr = load_image_bgr(image_path)
         result = model.predict(
             source=str(image_path),
-            device="cpu",
+            device=inference_device,
             conf=conf_thr,
             verbose=False,
         )[0]
